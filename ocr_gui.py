@@ -81,7 +81,7 @@ def browse_folder():
 config = load_config()
 
 root = tk.Tk()
-root.title("Composition_OCR_Assistant V0.2")
+root.title("Composition_OCR_Assistant V0.3")
 root.geometry("800x600")
 
 icon_data = base64.b64decode(icon_base64)
