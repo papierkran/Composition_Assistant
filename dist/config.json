@@ -1,6 +1,18 @@
 {
-    "URL": "https://cbm01.cn-huabei-1.xf-yun.com/v1/private/se75ocrbm",
-    "APPID": "ef1639c2",
-    "API_KEY": "46b373e8c1b035e66362c8c35c4bbadb",
-    "ROOT_DIR": "H:\\作文\\12-14\\初一下午线下班"
+  "OCR": {
+    "URL": "http://webapi.xfyun.cn/v1/service/v1/ocr/handwriting",
+    "APPID": "",
+    "API_KEY": "",
+    "LANGUAGE": "cn|en",
+    "LOCATION": "false"
+  },
+  "DEEPSEEK": {
+    "ENABLED": false,
+    "API_KEY": "",
+    "MODEL": "deepseek-chat"
+  },
+  "APP": {
+    "ROOT_DIR": "",
+    "DEBUG": false
+  }
 }

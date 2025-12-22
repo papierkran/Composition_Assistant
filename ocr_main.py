@@ -4,25 +4,62 @@ import os
 import time
 import hashlib
 import base64
+from doctest import debug
+
 import requests
 from docx import Document
-from docx.shared import Pt
 from docx.oxml.ns import qn
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.shared import Cm, Pt
 from docx.enum.text import WD_LINE_SPACING
-from docx.shared import Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from openai import OpenAI
 
 import json
 
-# ========== 配置区 =================================================
-URL = "http://webapi.xfyun.cn/v1/service/v1/ocr/handwriting"
-APPID = ""
-API_KEY = ""
-language = "cn|en"
-location = "false"
+# CONFIG_FILE = "D:\person_data\ocer助手\presson.json"
+CONFIG_FILE = "config.json"
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        raise RuntimeError("❌ 未找到 config.json 或相关配置文件，请先配置")
+
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+config = load_config()
+
+
+
+# ========== 讯飞ocr配置区 =================================================
+OCR_CONFIG = config.get("OCR", {})
+
+URL = OCR_CONFIG.get("URL")
+APPID = OCR_CONFIG.get("APPID")
+API_KEY = OCR_CONFIG.get("API_KEY")
+language = OCR_CONFIG.get("LANGUAGE", "cn|en")
+location = OCR_CONFIG.get("LOCATION", "false")
+
+if not all([URL, APPID, API_KEY]):
+    raise RuntimeError("❌ OCR 配置不完整，请检查 config.json")
+
 # ==================================================================
 
 
+# ========== deepseek_api  配置区 =================================================
+DEEPSEEK_CONFIG = config.get("DEEPSEEK", {})
+
+DEEPSEEK_ENABLED = DEEPSEEK_CONFIG.get("ENABLED", False)
+DEEPSEEK_API_KEY = DEEPSEEK_CONFIG.get("API_KEY")
+DEEPSEEK_MODEL = DEEPSEEK_CONFIG.get("MODEL", "deepseek-chat")
+
+client = None
+
+# ==================================================================
+
+
+
+
+# 讯飞ocr相关设置
 def getHeader():
     curTime = str(int(time.time()))
     param = json.dumps({"language": language, "location": location})
@@ -38,7 +75,57 @@ def getHeader():
     }
     return header
 
+# deepseek api 相关设置
+def deepseek_fix_typos(text: str) -> str:
+    """
+    调用 DeepSeek，只修改错别字，不改变原意，不润色
+    """
+    prompt = (
+        "下面是一篇中文文章，请你【只修改错别字和明显的识别错误】。\n"
+        "要求：\n"
+        "1. 不改变原意\n"
+        "2. 不润色文风\n"
+        "3. 不增删内容\n"
+        "4. 保持原有段落结构\n"
+        "5. 只输出修改后的完整文章正文\n"
+        "6. 格式应该是  标题  （\\n）下一行  ——xx(替换为姓名)  然后文章内容\n"
+        "标题不要出现 ‘题目：’ ‘标题：’等字样\n\n\n"
+        
+        f"{text}"
+    )
 
+    if debug:
+        print("\n=================【发送给 DeepSeek 的内容】=================\n")
+        print(prompt)
+        print("\n============================================================\n")
+
+
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": "你是一名严谨的中文校对助手"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+        stream=False
+    )
+
+    if debug:
+        print("\n=================【DeepSeek 原始返回 response】=================\n")
+        print(response)
+        print("\n==============================================================\n")
+
+    result_text = response.choices[0].message.content.strip()
+
+    if debug:
+        print("\n=================【DeepSeek 修改后的正文】=================\n")
+        print(result_text)
+        print("\n==========================================================\n")
+
+    return result_text
+
+
+# ocr 并处理自然段
 def ocr_and_extract_text(image_path):
     with open(image_path, 'rb') as f:
         imgfile = f.read()
@@ -47,6 +134,7 @@ def ocr_and_extract_text(image_path):
     headers = getHeader()
     resp = requests.post(URL, headers=headers, data=data)
     result = resp.json()
+    # print("OCR 原始返回：", result)
 
     if result.get('code') != '0':
         raise RuntimeError(f"OCR 失败: {result.get('desc')}")
@@ -86,7 +174,7 @@ def ocr_and_extract_text(image_path):
     return paragraphs   # ✅ 关键：返回段落列表
 
 
-
+#文档处理配置
 def create_word(doc_path, all_text_blocks,folder_display_name):
 
     doc = Document()
@@ -139,9 +227,11 @@ def has_images(folder_path):
     )
 
 
-def process_folder(folder_path, log_callback=print):
+
+# 识别图片
+def process_folder(folder_path, log_callback=print, use_deepseek=False, deepseek_api_key=None):
     folder_name = os.path.basename(folder_path)
-    all_paragraphs = []   # 这里直接叫 paragraphs 更清晰
+    all_paragraphs = []
 
     for filename in os.listdir(folder_path):
         if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
@@ -156,24 +246,184 @@ def process_folder(folder_path, log_callback=print):
     if all_paragraphs:
         doc_path = os.path.join(folder_path, f"{folder_name}.docx")
         log_callback(f"正在生成 Word：{doc_path}")
+
+        # ① 先生成 Word（修改前 / 修改后 框架）
         create_word(doc_path, all_paragraphs, folder_name)
+
+        # ② 再根据开关决定是否调用 DeepSeek
+        if use_deepseek:
+            log_callback("🤖 正在调用 DeepSeek 进行错别字纠正...")
+            fix_docx_with_deepseek(doc_path, deepseek_api_key)
+            log_callback("✅ DeepSeek 纠错完成")
+
     else:
         log_callback(f"{folder_path} 中没有可识别的图片")
 
-def process_all(root_dir, log_callback=print):
+# 寻找‘修改前’与‘修改后’中 的文章
+def extract_before_text(doc: Document):
+    collecting = False
+    paragraphs = []
+
+    for p in doc.paragraphs:
+        text = p.text.strip()
+
+        if text == "修改前：":
+            collecting = True
+            continue
+
+        if text == "修改后：":
+            break
+
+        if collecting and text:
+            paragraphs.append(text)
+
+    return paragraphs
+
+# 清空「修改前」正文并写入新内容
+def clear_before_text(doc: Document):
+    start = end = None
+
+    for i, p in enumerate(doc.paragraphs):
+        if p.text.strip() == "修改前：":
+            start = i
+        elif p.text.strip() == "修改后：" and start is not None:
+            end = i
+            break
+
+    if start is None or end is None:
+        return
+
+    # 删除 start+1 到 end-1
+    for i in range(end - 1, start, -1):
+        p = doc.paragraphs[i]
+        p._element.getparent().remove(p._element)
+
+
+
+
+
+def insert_before_text(doc: Document, new_paragraphs):
+    """
+    在“修改前：”下面插入 AI 修正后的正文，并在“修改后：”之前插入分页符。
+    如果没找到“修改后：”，则在刚插入的段落之后插入分页符（兜底）。
+    """
+
+    # 1) 找到“修改前：”所在位置（insert_index = 下一个段落的索引）
+    for i, p in enumerate(doc.paragraphs):
+        if p.text.strip() == "修改前：":
+            insert_index = i + 1
+            break
+    else:
+        print("⚠️ 未找到「修改前：」，跳过写入")
+        return
+
+    # 2) 记录已插入段落数，方便兜底时计算分页位置
+    inserted_count = 0
+
+    # 3) 插入 AI 返回的段落（保持顺序）
+    for para in new_paragraphs:
+        if not para or not para.strip():
+            continue
+        # 防止 AI 回传意外的标题
+        if para.strip() in ("修改前：", "修改后："):
+            continue
+
+        new_p = doc.add_paragraph(para)
+
+        # 设置格式：首行缩进、行距等
+        fmt = new_p.paragraph_format
+        fmt.first_line_indent = Cm(0.74)
+        fmt.space_before = Pt(0)
+        fmt.space_after = Pt(0)
+        fmt.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+        fmt.line_spacing = Pt(12)
+
+        # 把刚创建在文档末尾的段落移动到指定位置
+        doc._body._body.insert(insert_index, new_p._element)
+        insert_index += 1
+        inserted_count += 1
+
+    # 4) 尝试在“修改后：”之前插入分页符（优先）
+    page_break_index = None
+    for idx, p in enumerate(doc.paragraphs):
+        if p.text.strip() == "修改后：":
+            page_break_index = idx
+            break
+
+    # 5) 如果没找到“修改后：”，把分页符放在插入段落之后（兜底）
+    if page_break_index is None:
+        page_break_index = insert_index  # 刚插入段落后的索引
+
+    # 6) 创建一个新的段落并在其 run 上添加分页符（page break）
+    #    先 add_paragraph（位于文档末尾），然后把它移动到目标位置
+    pb_para = doc.add_paragraph()
+    run = pb_para.add_run()
+    run.add_break(WD_BREAK.PAGE)
+
+    # 插入分页段落到目标位置（这样分页就在 page_break_index 处）
+    doc._body._body.insert(page_break_index, pb_para._element)
+
+
+
+# ai 纠错功能
+def fix_docx_with_deepseek(docx_path, api_key):
+    global client
+
+    if not DEEPSEEK_ENABLED:
+        print("⚠️ DeepSeek 未启用，跳过纠错")
+        return
+
+    if not DEEPSEEK_API_KEY:
+        print("⚠️ 未配置 DeepSeek API Key，跳过纠错")
+        return
+
+    client = OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com"
+    )
+
+    doc = Document(docx_path)
+
+    before_paragraphs = extract_before_text(doc)
+    if not before_paragraphs:
+        print("未找到修改前正文，跳过")
+        return
+
+    full_text = "\n".join(before_paragraphs)
+    fixed_text = deepseek_fix_typos(full_text)
+
+    fixed_paragraphs = [
+        p.strip() for p in fixed_text.split("\n") if p.strip()
+    ]
+
+    clear_before_text(doc)
+    insert_before_text(doc, fixed_paragraphs)
+
+    doc.save(docx_path)
+
+
+
+
+
+
+# 遍历文件夹识别图片
+def process_all(root_dir, log_callback=print, use_deepseek=False, deepseek_api_key=None):
     if has_images(root_dir):
-        process_folder(root_dir, log_callback)
+        process_folder(root_dir, log_callback, use_deepseek, deepseek_api_key)
     else:
         for sub in os.listdir(root_dir):
             sub_path = os.path.join(root_dir, sub)
             if os.path.isdir(sub_path) and has_images(sub_path):
-                process_folder(sub_path, log_callback)
+                process_folder(sub_path, log_callback, use_deepseek, deepseek_api_key)
 
 
 if __name__ == '__main__':
     ROOT_DIR = input("请输入要处理的文件夹路径：").strip('" ')
     if not os.path.isdir(ROOT_DIR):
-        print("无效路径！请确认后再试。")
+        print("无效路径！")
     else:
-        process_all(ROOT_DIR)
+        process_all(
+            ROOT_DIR,
+            use_deepseek=DEEPSEEK_ENABLED
+        )
         print("全部处理完成！")

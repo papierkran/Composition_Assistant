@@ -1,6 +1,18 @@
 {
+  "OCR": {
     "URL": "http://webapi.xfyun.cn/v1/service/v1/ocr/handwriting",
-    "APPID": "945fe4ad",
-    "API_KEY": "055722a19796fea88a347d8e2d2e3db8",
-    "ROOT_DIR": "E:/project/py/ocrer/yuwen/5-19/漏/谭雅心"
+    "APPID": "",
+    "API_KEY": "",
+    "LANGUAGE": "cn|en",
+    "LOCATION": "false"
+  },
+  "DEEPSEEK": {
+    "ENABLED": false,
+    "API_KEY": "",
+    "MODEL": "deepseek-chat"
+  },
+  "APP": {
+    "ROOT_DIR": "",
+    "DEBUG": false
+  }
 }
