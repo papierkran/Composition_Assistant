@@ -1,16 +1,26 @@
 import base64
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import json
 import threading
 from datetime import datetime
 import sys
 import os
+import subprocess
+import re
+from pathlib import Path
 import customtkinter as ctk
+from docx import Document
+from docx.shared import Pt, Cm
+from docx.oxml.ns import qn
+from docx.enum.text import WD_LINE_SPACING, WD_BREAK
+from openai import OpenAI
+from PIL import Image, ImageTk
 
 
-CONFIG_FILE = "D:\person_data\ocer助手\presson.json"
-# CONFIG_FILE = "config.json"
+CONFIG_FILE = Path(os.environ.get("OCR_CONFIG_FILE", r"D:\person_data\ocer助手\presson.json")).expanduser()
+# 回退：CONFIG_FILE 可能会被环境变量 OCR_CONFIG_FILE 覆盖
+# 或者当配置文件缺失时，load_config 会使用本地 './config.json'。
 
 # ================= 默认配置 =================
 DEFAULT_CONFIG = {
@@ -26,15 +36,7 @@ DEFAULT_CONFIG = {
         "API_KEY": "",
         "MODEL": "deepseek-chat",
         "BASE_URL": "https://api.deepseek.com",
-        "PROMPT": "下面是一篇中文文章，请你只修改错别字和明显的错误。\n"
-              "要求：\n"
-              "1. 不改变原意\n"
-              "2. 不润色文风\n"
-              "3. 不增删内容\n"
-              "4. 保持原有段落结构\n"
-              "5. 只输出修改后的文章，不做任何解释，注释，说明\n"
-              "6.保留前两行的——及后面的姓名"
-              "下面我将发给你文章\n"
+        "PROMPT": 
                   "{text}"
     },
     "EDITOR": {
@@ -48,24 +50,49 @@ DEFAULT_CONFIG = {
         "ROOT_DIR": "",
         "DEBUG": False
     }
+    ,
+    "API_PROVIDERS": {
+        "Custom": "",
+        "DeepSeek": "https://api.deepseek.com",
+        "OpenAI": "https://api.openai.com/v1"
+    },
+    "AI_PROCESS": {
+        "API_KEY": "",
+        "BASE_URL": "https://api.deepseek.com",
+        "PROMPT": "下面是一篇中文文章，请你【只修改错别字和明显的识别错误】。\n要求：\n1. 不改变原意\n2. 不润色文风\n3. 不增删内容\n4. 保持原有段落结构\n5. 只输出修改后的完整文章正文\n"
+    }
 }
 
 # ================= 配置文件 =================
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+def load_config(path: Path = None):
+    """
+    从 JSON 文件加载配置。
+    尝试使用 `path`（或配置的 CONFIG_FILE）。
+    如果缺失，则回退到 './config.json'。在任何读取错误的情况下，返回 DEFAULT_CONFIG 的浅拷贝以允许界面启动。
+    """
+    cfg_path = Path(path or CONFIG_FILE)
+    if not cfg_path.exists():
+        local = Path("config.json")
+        if local.exists():
+            cfg_path = local
+        else:
             return DEFAULT_CONFIG.copy()
-    return DEFAULT_CONFIG.copy()
 
-def save_config(config):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT_CONFIG.copy()
+
+def save_config(config, path: Path = None):
+    """Save configuration to file. Ensures parent directory exists."""
+    cfg_path = Path(path or CONFIG_FILE)
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    with cfg_path.open("w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 # ================= 日志 =================
-def append_log(message):
+def append_log(message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     log_text.configure(state="normal")
     log_text.insert(tk.END, f"[{timestamp}] {message}\n")
@@ -82,13 +109,22 @@ def start_processing():
         config["APP"]["ROOT_DIR"] = path_entry.get().strip()
         config["DEEPSEEK"]["API_KEY"] = get_api_key_value('deepseek') or ""
         config["DEEPSEEK"]["ENABLED"] = use_deepseek_var.get()
-        config["DEEPSEEK"]["BASE_URL"] = deepseek_base_entry.get().strip()
+        # DeepSeek base URL: 如果选择了预设提供商，使用其 URL，否则使用自定义输入
+        deepseek_choice = deepseek_provider_menu.get()
+        if deepseek_choice and deepseek_choice != "Custom":
+            config["DEEPSEEK"]["BASE_URL"] = API_PROVIDERS.get(deepseek_choice, "")
+        else:
+            config["DEEPSEEK"]["BASE_URL"] = deepseek_base_entry.get().strip()
         config["DEEPSEEK"]["PROMPT"] = prompt_text.get("1.0", tk.END).strip()
         # 第二步 API 配置
         config.setdefault("EDITOR", {})
         config["EDITOR"]["ENABLED"] = use_editor_var.get()
         config["EDITOR"]["API_KEY"] = get_api_key_value('editor') or ""
-        config["EDITOR"]["BASE_URL"] = editor_base_entry.get().strip()
+        editor_choice = editor_provider_menu.get()
+        if editor_choice and editor_choice != "Custom":
+            config["EDITOR"]["BASE_URL"] = API_PROVIDERS.get(editor_choice, "")
+        else:
+            config["EDITOR"]["BASE_URL"] = editor_base_entry.get().strip()
         config["EDITOR"]["PROMPT"] = editor_prompt_text.get("1.0", tk.END).strip()
 
         # ---------- 校验 ----------
@@ -155,6 +191,20 @@ hidden_api_keys = {}
 # 当前活跃的 entry 映射（name->entry 或 None）
 entries_map = {}
 
+# 可选的 API 提供商（第一项为 自定义 Custom）
+API_PROVIDERS = {
+    "Custom": "",
+    "DeepSeek": "https://api.deepseek.com",
+    "OpenAI": "https://api.openai.com/v1"
+}
+
+
+def _find_provider_name_by_url(url: str):
+    for name, u in API_PROVIDERS.items():
+        if u and url and url.rstrip('/') == u.rstrip('/'):
+            return name
+    return "Custom"
+
 
 def make_mask_widget(name, parent):
     frame = ctk.CTkFrame(parent)
@@ -193,13 +243,13 @@ def get_api_key_value(name):
         return ent.get().strip()
     return hidden_api_keys.get(name)
 
-icon_base64=""" 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 """
+icon_base64="""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"""
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
 root = ctk.CTk()
-root.title("Composition OCR Assistant v0.5")
+root.title("Composition OCR Assistant v0.9")
 
 # 根据屏幕分辨率按 16:9 比例缩放窗口（占屏幕 40%）
 screen_w = root.winfo_screenwidth()
@@ -211,13 +261,68 @@ desired_h = int(desired_w * 16 / 9)
 root.geometry(f"{desired_w}x{desired_h}")
 root.resizable(False, False)
 
-icon_data = base64.b64decode(icon_base64)
-photo = tk.PhotoImage(data=icon_base64)
-root.iconphoto(True, photo)
+# 加载图标：优先使用 app.ico，否则回退到 base64
+try:
+    # 尝试加载本地 app.ico 文件（支持相对路径和绝对路径）
+    ico_path = Path("./app.ico")
+    
+    # 如果相对路径不存在，尝试脚本所在目录
+    if not ico_path.exists():
+        script_dir = Path(__file__).parent
+        ico_path = script_dir / "app.ico"
+    
+    if ico_path.exists():
+        # 使用绝对路径避免路径问题
+        ico_abs_path = str(ico_path.resolve())
+        root.iconbitmap(ico_abs_path)
+    else:
+        raise FileNotFoundError("app.ico not found")
+except Exception as e:
+    # 回退：使用 base64 编码的图标
+    try:
+        import io
+        from PIL import Image, ImageTk
+        icon_data = base64.b64decode(icon_base64.strip())
+        image = Image.open(io.BytesIO(icon_data))
+        # 调整图标大小（可选，但对于显示效果更好）
+        image = image.resize((32, 32), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        root.iconphoto(False, photo)
+        root._icon_photo = photo
+    except Exception:
+        try:
+            photo = tk.PhotoImage(data=icon_base64.strip())
+            root.iconphoto(False, photo)
+            root._icon_photo = photo
+        except Exception:
+            pass
 
+
+# ========== 页面切换框架 ==========
+pages = {}
+current_page = tk.StringVar(value="ocr")
+
+def show_page(page_name):
+    """显示指定页面"""
+    current_page.set(page_name)
+    for page in pages.values():
+        page.pack_forget()
+    pages[page_name].pack(fill="both", expand=True)
+
+# 顶部按钮框
+top_frame = ctk.CTkFrame(root)
+top_frame.pack(side="top", fill="x", padx=5, pady=5)
+
+ctk.CTkLabel(top_frame, text="功能选择:", text_color="gray").pack(side="left", padx=5)
+ctk.CTkButton(top_frame, text="图片转作文", width=100, command=lambda: show_page("ocr")).pack(side="left", padx=3)
+ctk.CTkButton(top_frame, text="docx作文处理", width=100, command=lambda: show_page("ai")).pack(side="left", padx=3)
+
+# ========== PAGE 1: OCR 处理 ==========
+page1 = ctk.CTkScrollableFrame(root)
+pages["ocr"] = page1
 
 # OCR 配置（标签与输入框同一行）
-ocr_frame = ctk.CTkFrame(root)
+ocr_frame = ctk.CTkFrame(page1)
 ocr_frame.pack(padx=10, fill="x")
 ctk.CTkLabel(ocr_frame, text="OCR 接口 URL").pack(side="left", padx=(0, 8))
 url_entry = ctk.CTkEntry(ocr_frame)
@@ -225,20 +330,19 @@ url_entry.insert(0, config["OCR"]["URL"])
 url_entry.pack(side="left", fill="x", expand=True)
 
 # APPID 与 API_KEY 同行布局
-appid_frame = ctk.CTkFrame(root)
+appid_frame = ctk.CTkFrame(page1)
 appid_frame.pack(padx=10, fill="x")
 ctk.CTkLabel(appid_frame, text="APPID").pack(side="left", padx=(0, 8))
 appid_entry = ctk.CTkEntry(appid_frame)
 appid_entry.insert(0, config["OCR"]["APPID"])
 appid_entry.pack(side="left", fill="x", expand=True)
 
-apikey_frame = ctk.CTkFrame(root)
+apikey_frame = ctk.CTkFrame(page1)
 apikey_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(apikey_frame, text="API_KEY").pack(side="left", padx=(0, 8))
 apikey_entry = ctk.CTkEntry(apikey_frame)
 apikey_entry.insert(0, config["OCR"]["API_KEY"])
 apikey_entry.pack(side="left", fill="x", expand=True)
-# 记录并根据已有配置隐藏
 entries_map['ocr'] = apikey_entry
 if config["OCR"].get("API_KEY"):
     hidden_api_keys['ocr'] = config["OCR"]["API_KEY"]
@@ -247,15 +351,13 @@ if config["OCR"].get("API_KEY"):
     mask.pack(side="left")
     entries_map['ocr'] = None
 
-# DeepSeek
-# DeepSeek API Key 与 启用开关 同行
-deepseek_frame = ctk.CTkFrame(root)
+# 第一步 AI 改错别字
+deepseek_frame = ctk.CTkFrame(page1)
 deepseek_frame.pack(padx=10, fill="x", pady=(10,0))
 ctk.CTkLabel(deepseek_frame, text="AI API Key（输入AI的apikey）").pack(side="left", padx=(0,8))
 deepseek_entry = ctk.CTkEntry(deepseek_frame)
 deepseek_entry.insert(0, config["DEEPSEEK"]["API_KEY"])
 deepseek_entry.pack(side="left", fill="x", expand=True)
-# 记录并根据已有配置隐藏
 entries_map['deepseek'] = deepseek_entry
 if config["DEEPSEEK"].get("API_KEY"):
     hidden_api_keys['deepseek'] = config["DEEPSEEK"]["API_KEY"]
@@ -268,36 +370,51 @@ use_deepseek_var = tk.BooleanVar(value=config["DEEPSEEK"]["ENABLED"])
 ctk.CTkCheckBox(deepseek_frame, text="启用 AI 错别字自动修正（较慢）", variable=use_deepseek_var).pack(side="left", padx=8)
 
 # DeepSeek Base URL 同行
-deepseek_base_frame = ctk.CTkFrame(root)
+deepseek_base_frame = ctk.CTkFrame(page1)
 deepseek_base_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(deepseek_base_frame, text="AI 改错别字（Base URL）").pack(side="left", padx=(0,8))
+deepseek_provider_name = _find_provider_name_by_url(config["DEEPSEEK"].get("BASE_URL", ""))
+deepseek_provider_menu = ctk.CTkOptionMenu(deepseek_base_frame, values=list(API_PROVIDERS.keys()))
+deepseek_provider_menu.set(deepseek_provider_name)
+deepseek_provider_menu.pack(side="left", padx=(0,8))
+
 deepseek_base_entry = ctk.CTkEntry(deepseek_base_frame)
-deepseek_base_entry.insert(0, config["DEEPSEEK"].get("BASE_URL", "https://api.deepseek.com"))
+deepseek_base_entry.insert(0, config["DEEPSEEK"].get("BASE_URL", ""))
 deepseek_base_entry.pack(side="left", fill="x", expand=True)
 
+def _on_deepseek_provider_change(choice):
+    if choice == "Custom":
+        deepseek_base_entry.configure(state="normal")
+    else:
+        deepseek_base_entry.configure(state="normal")
+        deepseek_base_entry.delete(0, tk.END)
+        deepseek_base_entry.insert(0, API_PROVIDERS.get(choice, ""))
+        deepseek_base_entry.configure(state="disabled")
+
+deepseek_provider_menu.configure(command=_on_deepseek_provider_change)
+_on_deepseek_provider_change(deepseek_provider_name)
+
 # Prompt（多行）
-# DeepSeek Prompt（多行）标签与文本框在同一行（文本框高度固定）
-prompt_frame = ctk.CTkFrame(root)
+prompt_frame = ctk.CTkFrame(page1)
 prompt_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(prompt_frame, text="自定义修改错别字提示词").pack(side="left", padx=(0,8), anchor="n")
 prompt_text = ctk.CTkTextbox(prompt_frame, height=140)
 prompt_text.insert("1.0", config["DEEPSEEK"].get("PROMPT") or DEFAULT_CONFIG["DEEPSEEK"]["PROMPT"])
 prompt_text.pack(side="left", fill="x", expand=True)
 
-# ----- 编辑 API（第二步）
+# 编辑 API（第二步）
 use_editor_var = tk.BooleanVar(value=config.get("EDITOR", {}).get("ENABLED", False))
-editor_enable_frame = ctk.CTkFrame(root)
+editor_enable_frame = ctk.CTkFrame(page1)
 editor_enable_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkCheckBox(editor_enable_frame, text="启用 第二步 修改作文", variable=use_editor_var).pack(side="left")
 
 # 第二步 API Key 同行
-editor_key_frame = ctk.CTkFrame(root)
+editor_key_frame = ctk.CTkFrame(page1)
 editor_key_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(editor_key_frame, text="第二步 AI API Key（输入AI的apikey）").pack(side="left", padx=(0,8))
 editor_key_entry = ctk.CTkEntry(editor_key_frame)
 editor_key_entry.insert(0, config.get("EDITOR", {}).get("API_KEY", ""))
 editor_key_entry.pack(side="left", fill="x", expand=True)
-# 记录并根据已有配置隐藏
 entries_map['editor'] = editor_key_entry
 if config.get("EDITOR", {}).get("API_KEY"):
     hidden_api_keys['editor'] = config.get("EDITOR", {}).get("API_KEY")
@@ -307,15 +424,32 @@ if config.get("EDITOR", {}).get("API_KEY"):
     entries_map['editor'] = None
 
 # 第二步 Base URL 同行
-editor_base_frame = ctk.CTkFrame(root)
+editor_base_frame = ctk.CTkFrame(page1)
 editor_base_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(editor_base_frame, text="第二步 API Base URL（可选）").pack(side="left", padx=(0,8))
+editor_provider_name = _find_provider_name_by_url(config.get("EDITOR", {}).get("BASE_URL", ""))
+editor_provider_menu = ctk.CTkOptionMenu(editor_base_frame, values=list(API_PROVIDERS.keys()))
+editor_provider_menu.set(editor_provider_name)
+editor_provider_menu.pack(side="left", padx=(0,8))
+
 editor_base_entry = ctk.CTkEntry(editor_base_frame)
-editor_base_entry.insert(0, config.get("EDITOR", {}).get("BASE_URL", "https://api.deepseek.com"))
+editor_base_entry.insert(0, config.get("EDITOR", {}).get("BASE_URL", ""))
 editor_base_entry.pack(side="left", fill="x", expand=True)
 
-# 第二步 Prompt 多行（标签与文本框同一行，文本框固定高度）
-editor_prompt_frame = ctk.CTkFrame(root)
+def _on_editor_provider_change(choice):
+    if choice == "Custom":
+        editor_base_entry.configure(state="normal")
+    else:
+        editor_base_entry.configure(state="normal")
+        editor_base_entry.delete(0, tk.END)
+        editor_base_entry.insert(0, API_PROVIDERS.get(choice, ""))
+        editor_base_entry.configure(state="disabled")
+
+editor_provider_menu.configure(command=_on_editor_provider_change)
+_on_editor_provider_change(editor_provider_name)
+
+# 第二步 Prompt 多行
+editor_prompt_frame = ctk.CTkFrame(page1)
 editor_prompt_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(editor_prompt_frame, text="第二步 自定义 Prompt（可选）").pack(side="left", padx=(0,8), anchor="n")
 editor_prompt_text = ctk.CTkTextbox(editor_prompt_frame, height=140)
@@ -323,8 +457,7 @@ editor_prompt_text.insert("1.0", config.get("EDITOR", {}).get("PROMPT") or DEFAU
 editor_prompt_text.pack(side="left", fill="x", expand=True)
 
 # 路径
-# 作文文件夹路径（标签 与 输入框 同行）
-path_frame = ctk.CTkFrame(root)
+path_frame = ctk.CTkFrame(page1)
 path_frame.pack(padx=10, fill="x", pady=(10,0))
 ctk.CTkLabel(path_frame, text="作文文件夹路径").pack(side="left", padx=(0,8))
 path_entry = ctk.CTkEntry(path_frame)
@@ -333,12 +466,476 @@ path_entry.pack(side="left", fill="x", expand=True)
 ctk.CTkButton(path_frame, text="浏览", command=browse_folder).pack(side="left", padx=8)
 
 # 启动
-ctk.CTkButton(root, text="开始处理", fg_color="#4CAF50", text_color="white", height=40, command=start_processing).pack(pady=12)
+ctk.CTkButton(page1, text="开始处理", fg_color="#4CAF50", text_color="white", height=40, command=start_processing).pack(pady=12)
 
 # 日志
-ctk.CTkLabel(root, text="运行日志").pack(anchor="w", padx=10)
-log_text = ctk.CTkTextbox(root, width=920, height=200)
+ctk.CTkLabel(page1, text="运行日志").pack(anchor="w", padx=10)
+log_text = ctk.CTkTextbox(page1, width=920, height=200)
 log_text.configure(state="disabled")
 log_text.pack(padx=10, pady=(0, 10), fill="both", expand=True)
+
+# ========== PAGE 2: AI 综合处理 - 可拖动任务流 ==========
+page2 = ctk.CTkScrollableFrame(root)
+pages["ai"] = page2
+
+# 任务列表配置（顺序：6→1→AI→2→3→5）
+task_config = [
+    {"id": "6", "name": "6. 转换 DOC → DOCX", "enabled": True, "order": 0},
+    {"id": "1", "name": "1. 清除空格", "enabled": True, "order": 1},
+    {"id": "AI", "name": "🤖 AI 改作文", "enabled": True, "order": 2},
+    {"id": "2", "name": '2. 添加"修改前/后"', "enabled": True, "order": 3},
+    {"id": "3", "name": "3. 格式化字体段落", "enabled": True, "order": 4},
+    {"id": "5", "name": "5. 修改作者", "enabled": True, "order": 5},
+]
+
+# 文件夹选择
+ai_path_frame = ctk.CTkFrame(page2)
+ai_path_frame.pack(padx=10, fill="x", pady=10)
+ctk.CTkLabel(ai_path_frame, text="处理文件夹").pack(side="left", padx=(0, 8))
+ai_path_entry = ctk.CTkEntry(ai_path_frame)
+ai_path_entry.pack(side="left", fill="x", expand=True)
+def browse_ai_folder():
+    folder = filedialog.askdirectory()
+    if folder:
+        ai_path_entry.delete(0, tk.END)
+        ai_path_entry.insert(0, folder)
+ctk.CTkButton(ai_path_frame, text="浏览", command=browse_ai_folder, width=80).pack(side="left", padx=8)
+
+# AI API Key
+ai_key_frame = ctk.CTkFrame(page2)
+ai_key_frame.pack(padx=10, fill="x", pady=(6, 0))
+ctk.CTkLabel(ai_key_frame, text="AI API Key").pack(side="left", padx=(0, 8))
+ai_key_entry = ctk.CTkEntry(ai_key_frame, show="*")
+ai_key_entry.insert(0, config.get("AI_PROCESS", {}).get("API_KEY", ""))
+ai_key_entry.pack(side="left", fill="x", expand=True)
+
+# Base URL
+ai_url_frame = ctk.CTkFrame(page2)
+ai_url_frame.pack(padx=10, fill="x", pady=(6, 0))
+ctk.CTkLabel(ai_url_frame, text="API Base URL").pack(side="left", padx=(0, 8))
+ai_url_entry = ctk.CTkEntry(ai_url_frame)
+ai_url_entry.insert(0, config.get("AI_PROCESS", {}).get("BASE_URL", "https://api.deepseek.com"))
+ai_url_entry.pack(side="left", fill="x", expand=True)
+
+# Prompt
+ai_prompt_frame = ctk.CTkFrame(page2)
+ai_prompt_frame.pack(padx=10, fill="x", pady=(6, 0))
+ctk.CTkLabel(ai_prompt_frame, text="AI Prompt").pack(side="left", padx=(0, 8), anchor="n")
+ai_prompt_text = ctk.CTkTextbox(ai_prompt_frame, height=80)
+ai_prompt_text.insert("1.0", config.get("AI_PROCESS", {}).get("PROMPT", DEFAULT_CONFIG["AI_PROCESS"]["PROMPT"]))
+ai_prompt_text.pack(side="left", fill="x", expand=True)
+
+# 任务流标签框架 - 可拖动和排序
+task_label = ctk.CTkLabel(page2, text="处理流程（勾选/取消步骤，拖动上下移动顺序）", text_color="gray", font=("", 12, "bold"))
+task_label.pack(anchor="w", padx=10, pady=(10, 5))
+
+task_frames_map = {}  # id -> {"frame": frame, "var": var}
+
+def create_task_frame(task):
+    """创建单个任务框，支持拖动排序 - 改进版实现"""
+    frame = ctk.CTkFrame(page2, fg_color=("#f0f0f0", "#1f1f1f"), border_width=1, border_color=("gray70", "gray30"))
+    frame.pack(padx=10, fill="x", pady=4)
+    
+    # 左侧：勾选框 + 拖动把手 + 任务名
+    left_frame = ctk.CTkFrame(frame, fg_color="transparent")
+    left_frame.pack(side="left", padx=10, pady=8, fill="x", expand=True)
+    
+    var = tk.BooleanVar(value=task["enabled"])
+    def on_check(val):
+        task["enabled"] = var.get()
+    
+    # 拖动把手（只在这个 widget 上绑定拖动事件）
+    handle_label = ctk.CTkLabel(left_frame, text="☰", text_color="gray", font=("", 14), cursor="hand2")
+    handle_label.pack(side="left", padx=(0, 5))
+    
+    # 拖动状态存储在 frame 的自定义属性中
+    frame._drag_state = {
+        "start_y": 0,
+        "is_dragging": False,
+        "initial_color": ("#f0f0f0", "#1f1f1f"),
+        "initial_border": ("gray70", "gray30")
+    }
+    
+    # 复选框
+    checkbox = ctk.CTkCheckBox(left_frame, text=task["name"], variable=var, command=on_check)
+    checkbox.pack(side="left", fill="x", expand=True)
+    
+    # ========== 拖动事件处理（只绑定在 handle_label） ==========
+    def on_handle_press(event):
+        """鼠标按下：记录起始位置"""
+        frame._drag_state["start_y"] = event.widget.winfo_rooty() + event.y
+        frame._drag_state["is_dragging"] = False
+        # 立即改变颜色表示可拖动
+        frame.configure(border_color=("cyan", "lightcyan"), fg_color=("#e8f4f8", "#2a3a3a"))
+    
+    def on_handle_drag(event):
+        """鼠标移动：检测并执行拖动"""
+        current_y = event.widget.winfo_rooty() + event.y
+        delta_y = current_y - frame._drag_state["start_y"]
+        
+        # 如果移动超过 30px，开始拖动
+        if abs(delta_y) > 30 and not frame._drag_state["is_dragging"]:
+            frame._drag_state["is_dragging"] = True
+            frame.configure(border_color=("blue", "lightblue"), fg_color=("#d0e8ff", "#1a2a3a"))
+        
+        # 持续拖动时，寻找目标位置
+        if frame._drag_state["is_dragging"]:
+            all_task_frames = [f for f in page2.winfo_children() 
+                              if isinstance(f, ctk.CTkFrame) and hasattr(f, "_drag_state") and f != frame]
+            
+            if not all_task_frames:
+                return
+            
+            current_y_abs = frame.winfo_rooty() + frame.winfo_height() // 2
+            
+            # 找到最近的其他 frame
+            closest_frame = None
+            closest_distance = float("inf")
+            insert_after = False  # True: 插入到目标下方; False: 插入到目标上方
+            
+            for other_frame in all_task_frames:
+                other_y = other_frame.winfo_rooty() + other_frame.winfo_height() // 2
+                distance = abs(current_y_abs - other_y)
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_frame = other_frame
+                    insert_after = current_y_abs > other_y
+            
+            # 如果最近距离足够近（40px），执行交换
+            if closest_frame and closest_distance < 40:
+                frame.configure(border_color=("green", "lightgreen"), fg_color=("#d8f5d8", "#1a2a1a"))
+                
+                # 交换位置
+                if insert_after:
+                    frame.pack_forget()
+                    frame.pack(padx=10, fill="x", pady=4, after=closest_frame)
+                else:
+                    frame.pack_forget()
+                    frame.pack(padx=10, fill="x", pady=4, before=closest_frame)
+                
+                # 更新 order
+                all_frames_current = [f for f in page2.winfo_children() 
+                                     if isinstance(f, ctk.CTkFrame) and hasattr(f, "_drag_state")]
+                for i, f in enumerate(all_frames_current):
+                    for task_item in task_config:
+                        if task_frames_map.get(task_item["id"], {}).get("frame") == f:
+                            task_item["order"] = i
+    
+    def on_handle_release(event):
+        """鼠标释放：恢复状态"""
+        # 恢复原始颜色
+        frame.configure(
+            border_color=frame._drag_state["initial_border"],
+            fg_color=frame._drag_state["initial_color"]
+        )
+        frame._drag_state["is_dragging"] = False
+    
+    # 只在拖动把手上绑定事件
+    handle_label.bind("<Button-1>", on_handle_press)
+    handle_label.bind("<B1-Motion>", on_handle_drag)
+    handle_label.bind("<ButtonRelease-1>", on_handle_release)
+    
+    # 存储任务框信息
+    task_frames_map[task["id"]] = {
+        "frame": frame,
+        "var": var
+    }
+    
+    return frame
+
+# 创建所有任务框
+for task in sorted(task_config, key=lambda x: x["order"]):
+    create_task_frame(task)
+
+# 启动按钮
+def start_ai_workflow():
+    def task():
+        folder = ai_path_entry.get().strip()
+        api_key = ai_key_entry.get().strip()
+        base_url = ai_url_entry.get().strip() or "https://api.deepseek.com"
+        prompt = ai_prompt_text.get("1.0", tk.END).strip() or None
+        
+        if not folder or not api_key:
+            append_log_ai("❌ 请填写文件夹路径和 API Key")
+            return
+        
+        if not os.path.isdir(folder):
+            append_log_ai("❌ 文件夹路径无效")
+            return
+        
+        # 保存配置
+        config.setdefault("AI_PROCESS", {})
+        config["AI_PROCESS"]["API_KEY"] = api_key
+        config["AI_PROCESS"]["BASE_URL"] = base_url
+        config["AI_PROCESS"]["PROMPT"] = prompt
+        save_config(config)
+        
+        append_log_ai("📋 开始处理流程...")
+        
+        # 第一步：复制所有原始文件为"改 XXX"
+        append_log_ai("【准备】复制原始文件...")
+        import shutil
+        copied_files = []
+        for root, _, files in os.walk(folder):
+            for file in files:
+                if file.lower().endswith(".docx") and not file.startswith("~$") and not file.startswith("改 "):
+                    original_path = os.path.join(root, file)
+                    new_filename = f"改 {file}"
+                    new_path = os.path.join(root, new_filename)
+                    try:
+                        shutil.copy2(original_path, new_path)
+                        copied_files.append(new_filename)
+                        append_log_ai(f"  ✓ {new_filename}")
+                    except Exception as e:
+                        append_log_ai(f"  ✗ {file} 复制失败: {e}")
+        
+        if not copied_files:
+            append_log_ai("❌ 未找到需要处理的文件")
+            return
+        
+        # 获取启用的任务列表
+        enabled_tasks = sorted(
+            [(t["id"], t["order"]) for t in task_config if t["enabled"]],
+            key=lambda x: x[1]
+        )
+        
+        try:
+            for task_id, _ in enabled_tasks:
+                if task_id == "6":
+                    append_log_ai("【步骤 6】转换 DOC → DOCX...")
+                    _convert_docs(folder, process_only_modified=True)
+                elif task_id == "1":
+                    append_log_ai("【步骤 1】清除空格...")
+                    _clear_spaces(folder, process_only_modified=True)
+                elif task_id == "AI":
+                    append_log_ai("【步骤 AI】发送给 AI 修正...")
+                    _process_ai(folder, api_key, base_url, prompt, process_only_modified=True)
+                elif task_id == "2":
+                    append_log_ai("【步骤 2】添加标签...")
+                    _add_labels(folder, process_only_modified=True)
+                elif task_id == "3":
+                    append_log_ai("【步骤 3】格式化...")
+                    _format_docs(folder, process_only_modified=True)
+                elif task_id == "5":
+                    append_log_ai("【步骤 5】修改作者...")
+                    _set_author(folder, process_only_modified=True)
+            
+            append_log_ai("✅ 所有流程完成！")
+        except Exception as e:
+            append_log_ai(f"❌ 处理失败：{e}")
+            import traceback
+            traceback.print_exc()
+    
+    threading.Thread(target=task, daemon=True).start()
+
+def append_log_ai(message: str):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    ai_log_text.configure(state="normal")
+    ai_log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+    ai_log_text.see(tk.END)
+    ai_log_text.configure(state="disabled")
+
+# 各步骤的处理函数
+def _convert_docs(folder, process_only_modified=False):
+    """步骤 6：转换 DOC → DOCX"""
+    import subprocess
+    for root, _, files in os.walk(folder):
+        for file in files:
+            # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
+            if process_only_modified and not file.startswith("改 "):
+                continue
+            if file.lower().endswith(".doc") and not file.startswith("~$"):
+                doc_path = os.path.join(root, file)
+                try:
+                    cmd = ["soffice", "--headless", "--convert-to", "docx", doc_path, "--outdir", root]
+                    subprocess.run(cmd, capture_output=True, timeout=30)
+                    base_name = os.path.splitext(os.path.basename(doc_path))[0]
+                    new_path = os.path.join(root, base_name + ".docx")
+                    if os.path.exists(new_path):
+                        os.remove(doc_path)
+                        append_log_ai(f"  ✓ {base_name}")
+                except Exception as e:
+                    append_log_ai(f"  ✗ {file}: {e}")
+
+def _clear_spaces(folder, process_only_modified=False):
+    """步骤 1：清除空格"""
+    for root, _, files in os.walk(folder):
+        for file in files:
+            # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
+            if process_only_modified and not file.startswith("改 "):
+                continue
+            if file.lower().endswith(".docx") and not file.startswith("~$"):
+                doc_path = os.path.join(root, file)
+                try:
+                    doc = Document(doc_path)
+                    for para in doc.paragraphs:
+                        for run in para.runs:
+                            run.text = run.text.strip()
+                    doc.save(doc_path)
+                    append_log_ai(f"  ✓ {file}")
+                except Exception as e:
+                    append_log_ai(f"  ✗ {file}: {e}")
+
+def _process_ai(folder, api_key, base_url, prompt_template, process_only_modified=False):
+    """步骤 AI：AI 处理 - 保留原始内容，追加修改后的内容"""
+    if not prompt_template:
+        prompt_template = (
+            "下面是一篇中文文章，请你【只修改错别字和明显的识别错误】。\n"
+            "要求：1. 不改变原意 2. 不润色文风 3. 不增删内容 4. 保持原有段落结构 5. 只输出修改后的完整文章正文\n"
+        )
+    
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    for root, _, files in os.walk(folder):
+        for file in files:
+            # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
+            if process_only_modified and not file.startswith("改 "):
+                continue
+            if file.lower().endswith(".docx") and not file.startswith("~$"):
+                doc_path = os.path.join(root, file)
+                try:
+                    doc = Document(doc_path)
+                    all_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                    
+                    if not all_text.strip():
+                        append_log_ai(f"  ⊘ {file} (空文档)")
+                        continue
+                    
+                    if "{text}" in prompt_template:
+                        full_prompt = prompt_template.format(text=all_text)
+                    else:
+                        full_prompt = prompt_template + "\n\n" + all_text
+                    
+                    response = client.chat.completions.create(
+                        model="deepseek-chat",
+                        messages=[
+                            {"role": "system", "content": "你是一名严谨的中文校对助手"},
+                            {"role": "user", "content": full_prompt},
+                        ],
+                        temperature=0.1,
+                        stream=False
+                    )
+                    
+                    ai_result = response.choices[0].message.content.strip()
+                    
+                    # 在原始内容末尾添加 "修改后：" 标签和空行
+                    last_para = doc.paragraphs[-1] if doc.paragraphs else None
+                    if last_para:
+                        if last_para.runs:
+                            last_para.runs[-1].add_break(WD_BREAK.PAGE)
+                        else:
+                            last_para.add_run().add_break(WD_BREAK.PAGE)
+                    
+                    # 添加 "修改后：" 标签
+                    para_modify_label = doc.add_paragraph("修改后：")
+                    para_modify_label.paragraph_format.first_line_indent = Cm(0.74)
+                    para_modify_label.paragraph_format.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+                    para_modify_label.paragraph_format.line_spacing = Pt(12)
+                    
+                    # 追加 AI 修改后的内容
+                    for line in ai_result.split("\n"):
+                        if line.strip():
+                            p = doc.add_paragraph(line.strip())
+                            fmt = p.paragraph_format
+                            fmt.first_line_indent = Cm(0.74)
+                            fmt.space_before = Pt(0)
+                            fmt.space_after = Pt(0)
+                            fmt.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+                            fmt.line_spacing = Pt(12)
+                    
+                    doc.save(doc_path)
+                    append_log_ai(f"  ✓ {file}")
+                except Exception as e:
+                    append_log_ai(f"  ✗ {file}: {e}")
+
+def _add_labels(folder, process_only_modified=False):
+    """步骤 2：添加标签 - 仅当 AI 步骤未运行时才添加分页符和修改后标签"""
+    for root, _, files in os.walk(folder):
+        for file in files:
+            # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
+            if process_only_modified and not file.startswith("改 "):
+                continue
+            if file.lower().endswith(".docx") and not file.startswith("~$"):
+                doc_path = os.path.join(root, file)
+                try:
+                    doc = Document(doc_path)
+                    if doc.paragraphs:
+                        # 检查是否已经有"修改后："标签（说明 AI 步骤已执行）
+                        last_para = doc.paragraphs[-1]
+                        has_modify_label = last_para.text.strip() == "修改后：" or \
+                                         (len(doc.paragraphs) > 1 and doc.paragraphs[-2].text.strip() == "修改后：")
+                        
+                        # 如果还没有"修改前："标签，则添加
+                        if doc.paragraphs[0].text.strip() != "修改前：":
+                            doc.paragraphs[0].insert_paragraph_before("修改前：")
+                        
+                        # 如果还没有"修改后："标签（AI 步骤未运行），则添加分页符和修改后标签
+                        if not has_modify_label:
+                            last_para = doc.paragraphs[-1]
+                            if last_para.runs:
+                                last_para.runs[-1].add_break(WD_BREAK.PAGE)
+                            else:
+                                last_para.add_run().add_break(WD_BREAK.PAGE)
+                            para_after = doc.add_paragraph("修改后：")
+                            para_after.paragraph_format.first_line_indent = Cm(0.74)
+                            para_after.paragraph_format.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+                            para_after.paragraph_format.line_spacing = Pt(12)
+                    doc.save(doc_path)
+                    append_log_ai(f"  ✓ {file}")
+                except Exception as e:
+                    append_log_ai(f"  ✗ {file}: {e}")
+
+def _format_docs(folder, process_only_modified=False):
+    """步骤 3：格式化"""
+    for root, _, files in os.walk(folder):
+        for file in files:
+            # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
+            if process_only_modified and not file.startswith("改 "):
+                continue
+            if file.lower().endswith(".docx") and not file.startswith("~$"):
+                doc_path = os.path.join(root, file)
+                try:
+                    doc = Document(doc_path)
+                    style = doc.styles["Normal"]
+                    style.font.name = "宋体"
+                    style.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+                    style.font.size = Pt(12)
+                    for para in doc.paragraphs:
+                        para.paragraph_format.first_line_indent = Cm(0.74)
+                        para.paragraph_format.space_before = Pt(0)
+                        para.paragraph_format.space_after = Pt(0)
+                        para.paragraph_format.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+                        para.paragraph_format.line_spacing = Pt(12)
+                    doc.save(doc_path)
+                    append_log_ai(f"  ✓ {file}")
+                except Exception as e:
+                    append_log_ai(f"  ✗ {file}: {e}")
+
+def _set_author(folder, process_only_modified=False):
+    """步骤 5：修改作者"""
+    for root, _, files in os.walk(folder):
+        for file in files:
+            # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
+            if process_only_modified and not file.startswith("改 "):
+                continue
+            if file.lower().endswith(".docx") and not file.startswith("~$"):
+                doc_path = os.path.join(root, file)
+                try:
+                    doc = Document(doc_path)
+                    doc.core_properties.author = "思睿教育_美丽可爱的尹老师"
+                    doc.save(doc_path)
+                    append_log_ai(f"  ✓ {file}")
+                except Exception as e:
+                    append_log_ai(f"  ✗ {file}: {e}")
+
+ctk.CTkButton(page2, text="▶ 开始流程", fg_color="#2196F3", text_color="white", height=40, command=start_ai_workflow).pack(pady=12)
+
+# 日志
+ctk.CTkLabel(page2, text="处理日志").pack(anchor="w", padx=10)
+ai_log_text = ctk.CTkTextbox(page2, width=920, height=220)
+ai_log_text.configure(state="disabled")
+ai_log_text.pack(padx=10, pady=(0, 10), fill="both", expand=True)
+
+# 默认显示第一页
+show_page("ocr")
 
 root.mainloop()
