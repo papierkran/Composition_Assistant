@@ -16,8 +16,8 @@ from openai import OpenAI
 
 import json
 
-# CONFIG_FILE = "D:\person_data\ocer助手\presson.json"
-CONFIG_FILE = "config.json"
+CONFIG_FILE = "D:\person_data\ocer助手\presson.json"
+# CONFIG_FILE = "config.json"
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -52,6 +52,19 @@ DEEPSEEK_ENABLED = DEEPSEEK_CONFIG.get("ENABLED", False)
 DEEPSEEK_API_KEY = DEEPSEEK_CONFIG.get("API_KEY")
 DEEPSEEK_MODEL = DEEPSEEK_CONFIG.get("MODEL", "deepseek-chat")
 
+DEEPSEEK_BASE_URL = DEEPSEEK_CONFIG.get("BASE_URL", "https://api.deepseek.com")
+DEFAULT_DEEPSEEK_PROMPT = DEEPSEEK_CONFIG.get("PROMPT", (
+    "下面是一篇中文文章，请你【只修改错别字和明显的识别错误】。\n"
+    "要求：\n"
+    "1. 不改变原意\n"
+    "2. 不润色文风\n"
+    "3. 不增删内容\n"
+    "4. 保持原有段落结构\n"
+    "5. 只输出修改后的完整文章正文\n"
+    "6. 格式应该是  标题  （\\n）下一行  ——xx(替换为姓名)  然后文章内容\n"
+    "标题不要出现 ‘题目：’ ‘标题：’等字样\n\n"
+    "{text}"
+))
 client = None
 
 # ==================================================================
@@ -76,23 +89,18 @@ def getHeader():
     return header
 
 # deepseek api 相关设置
-def deepseek_fix_typos(text: str) -> str:
+def deepseek_fix_typos(prompt_template: str, text: str) -> str:
     """
-    调用 DeepSeek，只修改错别字，不改变原意，不润色
+    调用 DeepSeek，只修改错别字，不改变原意，不润色。
+    `prompt_template` 可以包含 `{text}` 占位符；如果没有，会把 `text` 追加到末尾。
     """
-    prompt = (
-        "下面是一篇中文文章，请你【只修改错别字和明显的识别错误】。\n"
-        "要求：\n"
-        "1. 不改变原意\n"
-        "2. 不润色文风\n"
-        "3. 不增删内容\n"
-        "4. 保持原有段落结构\n"
-        "5. 只输出修改后的完整文章正文\n"
-        "6. 格式应该是  标题  （\\n）下一行  ——xx(替换为姓名)  然后文章内容\n"
-        "标题不要出现 ‘题目：’ ‘标题：’等字样\n\n\n"
-        
-        f"{text}"
-    )
+    if not prompt_template:
+        prompt_template = DEFAULT_DEEPSEEK_PROMPT
+
+    if "{text}" in prompt_template:
+        prompt = prompt_template.format(text=text)
+    else:
+        prompt = prompt_template + "\n\n" + text
 
     if debug:
         print("\n=================【发送给 DeepSeek 的内容】=================\n")
@@ -101,7 +109,7 @@ def deepseek_fix_typos(text: str) -> str:
 
 
     response = client.chat.completions.create(
-        model="deepseek-chat",
+        model=DEEPSEEK_MODEL,
         messages=[
             {"role": "system", "content": "你是一名严谨的中文校对助手"},
             {"role": "user", "content": prompt},
@@ -229,7 +237,7 @@ def has_images(folder_path):
 
 
 # 识别图片
-def process_folder(folder_path, log_callback=print, use_deepseek=False, deepseek_api_key=None):
+def process_folder(folder_path, log_callback=print, use_deepseek=False, deepseek_api_key=None, deepseek_base_url=None, deepseek_prompt_template=None, use_editor=False, editor_api_key=None, editor_base_url=None, editor_prompt_template=None):
     folder_name = os.path.basename(folder_path)
     all_paragraphs = []
 
@@ -253,8 +261,14 @@ def process_folder(folder_path, log_callback=print, use_deepseek=False, deepseek
         # ② 再根据开关决定是否调用 DeepSeek
         if use_deepseek:
             log_callback("🤖 正在调用 DeepSeek 进行错别字纠正...")
-            fix_docx_with_deepseek(doc_path, deepseek_api_key)
+            fix_docx_with_deepseek(doc_path, deepseek_api_key, base_url=deepseek_base_url, prompt_template=deepseek_prompt_template)
             log_callback("✅ DeepSeek 纠错完成")
+
+        # ③ 如果启用了第二步编辑，再把纠正后的正文送到另一个 API 处理
+        if use_editor:
+            log_callback("🤖 正在调用 第二步 API 进行作文改写...")
+            edit_docx_with_api(doc_path, editor_api_key, base_url=editor_base_url, prompt_template=editor_prompt_template)
+            log_callback("✅ 第二步改写完成")
 
     else:
         log_callback(f"{folder_path} 中没有可识别的图片")
@@ -364,22 +378,49 @@ def insert_before_text(doc: Document, new_paragraphs):
     doc._body._body.insert(page_break_index, pb_para._element)
 
 
+def insert_after_text(doc: Document, new_paragraphs):
+    """
+    在“修改后：”下面插入段落（不移动现有段落），如果未找到则追加到文档末尾。
+    """
+    for i, p in enumerate(doc.paragraphs):
+        if p.text.strip() == "修改后：":
+            insert_index = i + 1
+            break
+    else:
+        insert_index = len(doc.paragraphs)
+
+    for para in new_paragraphs:
+        if not para or not para.strip():
+            continue
+        if para.strip() in ("修改前：", "修改后："):
+            continue
+        new_p = doc.add_paragraph(para)
+        fmt = new_p.paragraph_format
+        fmt.first_line_indent = Cm(0.74)
+        fmt.space_before = Pt(0)
+        fmt.space_after = Pt(0)
+        fmt.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+        fmt.line_spacing = Pt(12)
+        doc._body._body.insert(insert_index, new_p._element)
+        insert_index += 1
+
+
 
 # ai 纠错功能
-def fix_docx_with_deepseek(docx_path, api_key):
+def fix_docx_with_deepseek(docx_path, api_key, base_url=None, prompt_template=None):
     global client
 
     if not DEEPSEEK_ENABLED:
         print("⚠️ DeepSeek 未启用，跳过纠错")
         return
 
-    if not DEEPSEEK_API_KEY:
+    if not api_key:
         print("⚠️ 未配置 DeepSeek API Key，跳过纠错")
         return
 
     client = OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com"
+        api_key=api_key,
+        base_url=(base_url or DEEPSEEK_BASE_URL)
     )
 
     doc = Document(docx_path)
@@ -390,7 +431,7 @@ def fix_docx_with_deepseek(docx_path, api_key):
         return
 
     full_text = "\n".join(before_paragraphs)
-    fixed_text = deepseek_fix_typos(full_text)
+    fixed_text = deepseek_fix_typos(prompt_template, full_text)
 
     fixed_paragraphs = [
         p.strip() for p in fixed_text.split("\n") if p.strip()
@@ -402,19 +443,77 @@ def fix_docx_with_deepseek(docx_path, api_key):
     doc.save(docx_path)
 
 
+def edit_docx_with_api(docx_path, api_key, base_url=None, prompt_template=None, model=None):
+    """
+    使用另一个 AI API（与 DeepSeek 调用逻辑一致）对已经被纠错后的文章进行进一步修改，
+    并将结果插入到“修改后：”之后。
+    """
+    global client
+
+    if not api_key:
+        print("⚠️ 第二步 API 未配置 API Key，跳过")
+        return
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=(base_url or DEEPSEEK_BASE_URL)
+    )
+
+    doc = Document(docx_path)
+
+    # 读取已纠错的正文（"修改前：" 区域）
+    corrected_paragraphs = extract_before_text(doc)
+    if not corrected_paragraphs:
+        print("未找到可供第二步处理的正文，跳过")
+        return
+
+    full_text = "\n".join(corrected_paragraphs)
+
+    # 生成 prompt
+    if not prompt_template:
+        prompt_template = DEFAULT_DEEPSEEK_PROMPT
+
+    if "{text}" in prompt_template:
+        prompt = prompt_template.format(text=full_text)
+    else:
+        prompt = prompt_template + "\n\n" + full_text
+
+    if debug:
+        print("\n=================【发送给 第二步 API 的内容】=================\n")
+        print(prompt)
+        print("\n============================================================\n")
+
+    response = client.chat.completions.create(
+        model=(model or DEEPSEEK_MODEL),
+        messages=[
+            {"role": "system", "content": "你是一名严谨的中文写作编辑助手"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+        stream=False
+    )
+
+    result_text = response.choices[0].message.content.strip()
+
+    edited_paragraphs = [p.strip() for p in result_text.split("\n") if p.strip()]
+
+    insert_after_text(doc, edited_paragraphs)
+    doc.save(docx_path)
+
+
 
 
 
 
 # 遍历文件夹识别图片
-def process_all(root_dir, log_callback=print, use_deepseek=False, deepseek_api_key=None):
+def process_all(root_dir, log_callback=print, use_deepseek=False, deepseek_api_key=None, deepseek_base_url=None, deepseek_prompt_template=None, use_editor=False, editor_api_key=None, editor_base_url=None, editor_prompt_template=None):
     if has_images(root_dir):
-        process_folder(root_dir, log_callback, use_deepseek, deepseek_api_key)
+        process_folder(root_dir, log_callback, use_deepseek, deepseek_api_key, deepseek_base_url, deepseek_prompt_template, use_editor, editor_api_key, editor_base_url, editor_prompt_template)
     else:
         for sub in os.listdir(root_dir):
             sub_path = os.path.join(root_dir, sub)
             if os.path.isdir(sub_path) and has_images(sub_path):
-                process_folder(sub_path, log_callback, use_deepseek, deepseek_api_key)
+                process_folder(sub_path, log_callback, use_deepseek, deepseek_api_key, deepseek_base_url, deepseek_prompt_template, use_editor, editor_api_key, editor_base_url, editor_prompt_template)
 
 
 if __name__ == '__main__':
@@ -424,6 +523,9 @@ if __name__ == '__main__':
     else:
         process_all(
             ROOT_DIR,
-            use_deepseek=DEEPSEEK_ENABLED
+            use_deepseek=DEEPSEEK_ENABLED,
+            deepseek_api_key=DEEPSEEK_API_KEY,
+            deepseek_base_url=DEEPSEEK_BASE_URL,
+            deepseek_prompt_template=DEFAULT_DEEPSEEK_PROMPT
         )
         print("全部处理完成！")
