@@ -183,6 +183,23 @@ def browse_folder():
         path_entry.delete(0, tk.END)
         path_entry.insert(0, folder)
 
+
+def iter_files_limited(folder, max_depth=4):
+    """遍历 folder，最多递归 max_depth 层（包含根目录为第0层）。
+    返回 (root, files) 与 os.walk 类似，但在达到深度限制时不再向下递归。
+    """
+    folder = os.path.abspath(folder)
+    for root, dirs, files in os.walk(folder, topdown=True):
+        rel = os.path.relpath(root, folder)
+        if rel == os.curdir:
+            depth = 0
+        else:
+            depth = len(rel.split(os.sep))
+        # 深度为 0..(max_depth-1) 可被处理；当达到阈值时阻止继续向下遍历
+        if depth >= max_depth - 1:
+            dirs[:] = []
+        yield root, files
+
 # ================= UI =================
 config = load_config()
 
@@ -251,15 +268,20 @@ ctk.set_default_color_theme("blue")
 root = ctk.CTk()
 root.title("Composition OCR Assistant v0.9")
 
-# 根据屏幕分辨率按 16:9 比例缩放窗口（占屏幕 40%）
+# 按基准分辨率 720, 1280 等比缩放窗口布局（根据当前屏幕计算缩放因子）
+BASE_W, BASE_H = 720, 1080
 screen_w = root.winfo_screenwidth()
 screen_h = root.winfo_screenheight()
-max_w = int(screen_w * 0.9)
-max_h = int(screen_h * 0.7)
-desired_w = min(max_w, int(max_h * 10 / 16))
-desired_h = int(desired_w * 16 / 9)
-root.geometry(f"{desired_w}x{desired_h}")
-root.resizable(False, False)
+scale = min(screen_w / BASE_W, screen_h / BASE_H)
+try:
+    root.tk.call('tk', 'scaling', scale)
+except Exception:
+    pass
+# 将窗口设置为基准尺寸的 90%（再乘以缩放因子），并确保不超过屏幕
+win_w = min(int(BASE_W * scale * 0.7), screen_w)
+win_h = min(int(BASE_H * scale * 0.6), screen_h)
+root.geometry(f"{win_w}x{win_h}")
+root.resizable(True, True)
 
 # 加载图标：优先使用 app.ico，否则回退到 base64
 try:
@@ -529,11 +551,15 @@ ai_prompt_text.pack(side="left", fill="x", expand=True)
 task_label = ctk.CTkLabel(page2, text="处理流程（勾选/取消步骤，拖动上下移动顺序）", text_color="gray", font=("", 12, "bold"))
 task_label.pack(anchor="w", padx=10, pady=(10, 5))
 
+# 创建任务流程容器框
+task_container = ctk.CTkFrame(page2, fg_color=("#ffffff", "#2a2a2a"), border_width=2, border_color=("gray50", "gray50"))
+task_container.pack(padx=10, pady=(0, 10), fill="both", expand=False)
+
 task_frames_map = {}  # id -> {"frame": frame, "var": var}
 
 def create_task_frame(task):
     """创建单个任务框，支持拖动排序 - 改进版实现"""
-    frame = ctk.CTkFrame(page2, fg_color=("#f0f0f0", "#1f1f1f"), border_width=1, border_color=("gray70", "gray30"))
+    frame = ctk.CTkFrame(task_container, fg_color=("#f0f0f0", "#1f1f1f"), border_width=1, border_color=("gray70", "gray30"))
     frame.pack(padx=10, fill="x", pady=4)
     
     # 左侧：勾选框 + 拖动把手 + 任务名
@@ -541,8 +567,10 @@ def create_task_frame(task):
     left_frame.pack(side="left", padx=10, pady=8, fill="x", expand=True)
     
     var = tk.BooleanVar(value=task["enabled"])
-    def on_check(val):
-        task["enabled"] = var.get()
+    # 使用 trace 绑定，确保变量变化总是同步到 task 配置
+    def _on_var_changed(*_):
+        task["enabled"] = bool(var.get())
+    var.trace_add("write", _on_var_changed)
     
     # 拖动把手（只在这个 widget 上绑定拖动事件）
     handle_label = ctk.CTkLabel(left_frame, text="☰", text_color="gray", font=("", 14), cursor="hand2")
@@ -556,8 +584,8 @@ def create_task_frame(task):
         "initial_border": ("gray70", "gray30")
     }
     
-    # 复选框
-    checkbox = ctk.CTkCheckBox(left_frame, text=task["name"], variable=var, command=on_check)
+    # 复选框（使用 trace 处理变量变化，无需额外回调）
+    checkbox = ctk.CTkCheckBox(left_frame, text=task["name"], variable=var)
     checkbox.pack(side="left", fill="x", expand=True)
     
     # ========== 拖动事件处理（只绑定在 handle_label） ==========
@@ -565,70 +593,114 @@ def create_task_frame(task):
         """鼠标按下：记录起始位置"""
         frame._drag_state["start_y"] = event.widget.winfo_rooty() + event.y
         frame._drag_state["is_dragging"] = False
-        # 立即改变颜色表示可拖动
+        # 视觉提示：改变颜色表示可拖动
         frame.configure(border_color=("cyan", "lightcyan"), fg_color=("#e8f4f8", "#2a3a3a"))
+        # 插入一个占位符（用于吸附效果），并暂时将被拖动的 frame 移除
+        try:
+            placeholder = ctk.CTkFrame(task_container, height=8, fg_color=("gray80", "gray20"))
+            # 在当前 frame 前插入占位符以保持原位
+            placeholder.pack(padx=10, fill="x", pady=4, before=frame)
+            frame._drag_state["placeholder"] = placeholder
+            # 把真实 frame 从布局中移除以便拖动并让占位符可见
+            frame.pack_forget()
+            frame.lift()
+        except Exception:
+            frame._drag_state.pop("placeholder", None)
     
     def on_handle_drag(event):
         """鼠标移动：检测并执行拖动"""
         current_y = event.widget.winfo_rooty() + event.y
         delta_y = current_y - frame._drag_state["start_y"]
-        
-        # 如果移动超过 30px，开始拖动
+
+        # 超过阈值才进入拖动状态
         if abs(delta_y) > 30 and not frame._drag_state["is_dragging"]:
             frame._drag_state["is_dragging"] = True
             frame.configure(border_color=("blue", "lightblue"), fg_color=("#d0e8ff", "#1a2a3a"))
-        
-        # 持续拖动时，寻找目标位置
-        if frame._drag_state["is_dragging"]:
-            all_task_frames = [f for f in page2.winfo_children() 
-                              if isinstance(f, ctk.CTkFrame) and hasattr(f, "_drag_state") and f != frame]
-            
-            if not all_task_frames:
-                return
-            
-            current_y_abs = frame.winfo_rooty() + frame.winfo_height() // 2
-            
-            # 找到最近的其他 frame
-            closest_frame = None
-            closest_distance = float("inf")
-            insert_after = False  # True: 插入到目标下方; False: 插入到目标上方
-            
-            for other_frame in all_task_frames:
-                other_y = other_frame.winfo_rooty() + other_frame.winfo_height() // 2
-                distance = abs(current_y_abs - other_y)
-                if distance < closest_distance:
-                    closest_distance = distance
-                    closest_frame = other_frame
-                    insert_after = current_y_abs > other_y
-            
-            # 如果最近距离足够近（40px），执行交换
-            if closest_frame and closest_distance < 40:
-                frame.configure(border_color=("green", "lightgreen"), fg_color=("#d8f5d8", "#1a2a1a"))
-                
-                # 交换位置
-                if insert_after:
-                    frame.pack_forget()
-                    frame.pack(padx=10, fill="x", pady=4, after=closest_frame)
+
+        if not frame._drag_state.get("is_dragging"):
+            return
+
+        # 计算当前应该插入的位置（按容器内其它任务的中点比较）
+        siblings = [f for f in task_container.winfo_children() if isinstance(f, ctk.CTkFrame) and getattr(f, "_drag_state", None) is not None and f != frame]
+        if not siblings:
+            frame._drag_state["insert_index"] = 0
+            return
+
+        insert_index = len(siblings)
+        current_y_abs = event.widget.winfo_rooty() + event.y
+        for i, other in enumerate(siblings):
+            other_mid = other.winfo_rooty() + other.winfo_height() // 2
+            if current_y_abs < other_mid:
+                insert_index = i
+                break
+
+        # 移动占位符到 insert_index 位置（占位符负责视觉吸附）
+        placeholder = frame._drag_state.get("placeholder")
+        if placeholder:
+            try:
+                placeholder.pack_forget()
+                if insert_index >= len(siblings):
+                    last = siblings[-1]
+                    placeholder.pack(padx=10, fill="x", pady=4, after=last)
                 else:
-                    frame.pack_forget()
-                    frame.pack(padx=10, fill="x", pady=4, before=closest_frame)
-                
-                # 更新 order
-                all_frames_current = [f for f in page2.winfo_children() 
-                                     if isinstance(f, ctk.CTkFrame) and hasattr(f, "_drag_state")]
-                for i, f in enumerate(all_frames_current):
-                    for task_item in task_config:
-                        if task_frames_map.get(task_item["id"], {}).get("frame") == f:
-                            task_item["order"] = i
+                    placeholder.pack(padx=10, fill="x", pady=4, before=siblings[insert_index])
+                frame._drag_state["insert_index"] = insert_index
+            except Exception:
+                pass
     
     def on_handle_release(event):
         """鼠标释放：恢复状态"""
-        # 恢复原始颜色
+        # 恢复原始视觉状态
         frame.configure(
             border_color=frame._drag_state["initial_border"],
             fg_color=frame._drag_state["initial_color"]
         )
         frame._drag_state["is_dragging"] = False
+
+        # 将真实 frame 插入到占位符所在位置（占位符是在容器中的临时占位）
+        insert_index = frame._drag_state.get("insert_index")
+        placeholder = frame._drag_state.get("placeholder")
+
+        # 清除占位符并在其原位置插入 frame
+        try:
+            # 列出当前（含占位符）容器子组件顺序，寻找 placeholder 的位置
+            children = list(task_container.winfo_children())
+            if placeholder in children:
+                idx = children.index(placeholder)
+            else:
+                idx = None
+            # 移除占位符视图
+            if placeholder:
+                placeholder.pack_forget()
+        except Exception:
+            idx = None
+
+        # 重新获取当前容器内的任务 frames（不包含正在拖动的 frame）
+        frames_now = [f for f in task_container.winfo_children() if isinstance(f, ctk.CTkFrame) and getattr(f, "_drag_state", None) is not None and f != frame]
+
+        # 如果没有确定索引，使用 insert_index（拖动计算）作为回退
+        if idx is None:
+            if insert_index is None or insert_index >= len(frames_now):
+                frame.pack(padx=10, fill="x", pady=4)
+            else:
+                frame.pack(padx=10, fill="x", pady=4, before=frames_now[insert_index])
+        else:
+            # 按 insert_index 插入
+            if insert_index is None or insert_index >= len(frames_now):
+                frame.pack(padx=10, fill="x", pady=4)
+            else:
+                frame.pack(padx=10, fill="x", pady=4, before=frames_now[insert_index])
+
+        # 最终一次性更新所有任务的 order（仅容器内的任务）
+        all_frames_current = [f for f in task_container.winfo_children() if isinstance(f, ctk.CTkFrame) and hasattr(f, "_drag_state")]
+        for i, f in enumerate(all_frames_current):
+            for task_item in task_config:
+                if task_frames_map.get(task_item["id"], {}).get("frame") == f:
+                    task_item["order"] = i
+
+        # 清理拖动状态
+        frame._drag_state.pop("placeholder", None)
+        frame._drag_state.pop("insert_index", None)
     
     # 只在拖动把手上绑定事件
     handle_label.bind("<Button-1>", on_handle_press)
@@ -672,13 +744,16 @@ def start_ai_workflow():
         
         append_log_ai("📋 开始处理流程...")
         
-        # 第一步：复制所有原始文件为"改 XXX"
-        append_log_ai("【准备】复制原始文件...")
+        # 第一步：复制所有原始文件为"改 XXX"（包含 docx 与常见图片格式，最多递归 4 层）
+        append_log_ai("【准备】复制原始文件（包含图片）...")
         import shutil
         copied_files = []
-        for root, _, files in os.walk(folder):
+        image_exts = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
+        for root, files in iter_files_limited(folder, max_depth=4):
             for file in files:
-                if file.lower().endswith(".docx") and not file.startswith("~$") and not file.startswith("改 "):
+                name_check = file.lstrip()
+                name_lower = file.lower()
+                if (name_lower.endswith(".docx") or name_lower.endswith(image_exts)) and not name_check.startswith("~$") and not name_check.startswith("改 "):
                     original_path = os.path.join(root, file)
                     new_filename = f"改 {file}"
                     new_path = os.path.join(root, new_filename)
@@ -739,12 +814,15 @@ def append_log_ai(message: str):
 def _convert_docs(folder, process_only_modified=False):
     """步骤 6：转换 DOC → DOCX"""
     import subprocess
-    for root, _, files in os.walk(folder):
+    for root, files in iter_files_limited(folder, max_depth=4):
         for file in files:
+            # 兼容文件名前导空格与中文名
+            name_check = file.lstrip()
+            name_lower = file.lower()
             # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
-            if process_only_modified and not file.startswith("改 "):
+            if process_only_modified and not name_check.startswith("改 "):
                 continue
-            if file.lower().endswith(".doc") and not file.startswith("~$"):
+            if name_lower.endswith(".doc") and not name_check.startswith("~$"):
                 doc_path = os.path.join(root, file)
                 try:
                     cmd = ["soffice", "--headless", "--convert-to", "docx", doc_path, "--outdir", root]
@@ -759,12 +837,14 @@ def _convert_docs(folder, process_only_modified=False):
 
 def _clear_spaces(folder, process_only_modified=False):
     """步骤 1：清除空格"""
-    for root, _, files in os.walk(folder):
+    for root, files in iter_files_limited(folder, max_depth=4):
         for file in files:
+            name_check = file.lstrip()
+            name_lower = file.lower()
             # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
-            if process_only_modified and not file.startswith("改 "):
+            if process_only_modified and not name_check.startswith("改 "):
                 continue
-            if file.lower().endswith(".docx") and not file.startswith("~$"):
+            if name_lower.endswith(".docx") and not name_check.startswith("~$"):
                 doc_path = os.path.join(root, file)
                 try:
                     doc = Document(doc_path)
@@ -785,12 +865,14 @@ def _process_ai(folder, api_key, base_url, prompt_template, process_only_modifie
         )
     
     client = OpenAI(api_key=api_key, base_url=base_url)
-    for root, _, files in os.walk(folder):
+    for root, files in iter_files_limited(folder, max_depth=4):
         for file in files:
+            name_check = file.lstrip()
+            name_lower = file.lower()
             # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
-            if process_only_modified and not file.startswith("改 "):
+            if process_only_modified and not name_check.startswith("改 "):
                 continue
-            if file.lower().endswith(".docx") and not file.startswith("~$"):
+            if name_lower.endswith(".docx") and not name_check.startswith("~$"):
                 doc_path = os.path.join(root, file)
                 try:
                     doc = Document(doc_path)
@@ -849,12 +931,14 @@ def _process_ai(folder, api_key, base_url, prompt_template, process_only_modifie
 
 def _add_labels(folder, process_only_modified=False):
     """步骤 2：添加标签 - 仅当 AI 步骤未运行时才添加分页符和修改后标签"""
-    for root, _, files in os.walk(folder):
+    for root, files in iter_files_limited(folder, max_depth=4):
         for file in files:
+            name_check = file.lstrip()
+            name_lower = file.lower()
             # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
-            if process_only_modified and not file.startswith("改 "):
+            if process_only_modified and not name_check.startswith("改 "):
                 continue
-            if file.lower().endswith(".docx") and not file.startswith("~$"):
+            if name_lower.endswith(".docx") and not name_check.startswith("~$"):
                 doc_path = os.path.join(root, file)
                 try:
                     doc = Document(doc_path)
@@ -886,12 +970,14 @@ def _add_labels(folder, process_only_modified=False):
 
 def _format_docs(folder, process_only_modified=False):
     """步骤 3：格式化"""
-    for root, _, files in os.walk(folder):
+    for root, files in iter_files_limited(folder, max_depth=4):
         for file in files:
+            name_check = file.lstrip()
+            name_lower = file.lower()
             # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
-            if process_only_modified and not file.startswith("改 "):
+            if process_only_modified and not name_check.startswith("改 "):
                 continue
-            if file.lower().endswith(".docx") and not file.startswith("~$"):
+            if name_lower.endswith(".docx") and not name_check.startswith("~$"):
                 doc_path = os.path.join(root, file)
                 try:
                     doc = Document(doc_path)
@@ -912,12 +998,14 @@ def _format_docs(folder, process_only_modified=False):
 
 def _set_author(folder, process_only_modified=False):
     """步骤 5：修改作者"""
-    for root, _, files in os.walk(folder):
+    for root, files in iter_files_limited(folder, max_depth=4):
         for file in files:
+            name_check = file.lstrip()
+            name_lower = file.lower()
             # 如果指定只处理修改文件，则跳过不以"改 "开头的文件
-            if process_only_modified and not file.startswith("改 "):
+            if process_only_modified and not name_check.startswith("改 "):
                 continue
-            if file.lower().endswith(".docx") and not file.startswith("~$"):
+            if name_lower.endswith(".docx") and not name_check.startswith("~$"):
                 doc_path = os.path.join(root, file)
                 try:
                     doc = Document(doc_path)
