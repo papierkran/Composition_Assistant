@@ -99,6 +99,140 @@ def append_log(message: str):
     log_text.see(tk.END)
     log_text.configure(state="disabled")
 
+# ================= 配置编辑窗口 =================
+def open_config_editor():
+    """弹出一个窗口，读取当前保存的配置文件，允许统一编辑 JSON 并保存。
+
+    设计目标：
+    - 不改动现有 UI 字段逻辑，只提供一个“高级/统一入口”
+    - 保存后刷新内存中的 config，并尽可能同步到当前页面的输入框
+    """
+    win = ctk.CTkToplevel(root)
+    win.title("配置编辑")
+    win.geometry("900x650")
+
+    # 让窗口位于主窗口之上
+    try:
+        win.transient(root)
+        win.grab_set()
+    except Exception:
+        pass
+
+    # 顶部提示
+    tip = (
+        "在此直接编辑配置文件内容（JSON）。\n"
+        "保存后会写入配置文件，并同步刷新当前界面。\n"
+        "注意：JSON 格式必须正确，否则无法保存。"
+    )
+    ctk.CTkLabel(win, text=tip, text_color="gray").pack(anchor="w", padx=12, pady=(12, 6))
+
+    # 编辑区
+    textbox = ctk.CTkTextbox(win)
+    textbox.pack(fill="both", expand=True, padx=12, pady=8)
+
+    # 读取当前配置（尽量从 CONFIG_FILE / fallback 的实际文件读）
+    cfg_path = Path(CONFIG_FILE)
+    if not cfg_path.exists():
+        local = Path("config.json")
+        if local.exists():
+            cfg_path = local
+
+    raw_text = ""
+    if cfg_path.exists():
+        try:
+            raw_text = cfg_path.read_text(encoding="utf-8")
+        except Exception as e:
+            raw_text = json.dumps(config, ensure_ascii=False, indent=2)
+            messagebox.showwarning("读取配置失败", f"读取 {cfg_path} 失败，将展示当前内存配置。\n原因：{e}")
+    else:
+        raw_text = json.dumps(config, ensure_ascii=False, indent=2)
+
+    textbox.insert("1.0", raw_text)
+
+    def _try_sync_ui_from_config():
+        """把内存 config 尽量同步到页面输入框（不强制覆盖隐藏 key 的遮罩逻辑）。"""
+        try:
+            # OCR
+            if 'url_entry' in globals():
+                url_entry.delete(0, tk.END)
+                url_entry.insert(0, config.get('OCR', {}).get('URL', ''))
+            if 'appid_entry' in globals():
+                appid_entry.delete(0, tk.END)
+                appid_entry.insert(0, config.get('OCR', {}).get('APPID', ''))
+            # 路径
+            if 'path_entry' in globals():
+                path_entry.delete(0, tk.END)
+                path_entry.insert(0, config.get('APP', {}).get('ROOT_DIR', ''))
+            # DeepSeek
+            if 'use_deepseek_var' in globals():
+                use_deepseek_var.set(bool(config.get('DEEPSEEK', {}).get('ENABLED', False)))
+            if 'deepseek_base_entry' in globals():
+                deepseek_base_entry.delete(0, tk.END)
+                deepseek_base_entry.insert(0, config.get('DEEPSEEK', {}).get('BASE_URL', ''))
+            if 'prompt_text' in globals():
+                prompt_text.delete('1.0', tk.END)
+                prompt_text.insert('1.0', config.get('DEEPSEEK', {}).get('PROMPT', ''))
+
+            # EDITOR
+            if 'use_editor_var' in globals():
+                use_editor_var.set(bool(config.get('EDITOR', {}).get('ENABLED', False)))
+            if 'editor_base_entry' in globals():
+                editor_base_entry.delete(0, tk.END)
+                editor_base_entry.insert(0, config.get('EDITOR', {}).get('BASE_URL', ''))
+            if 'editor_prompt_text' in globals():
+                editor_prompt_text.delete('1.0', tk.END)
+                editor_prompt_text.insert('1.0', config.get('EDITOR', {}).get('PROMPT', ''))
+        except Exception:
+            # 同步失败不影响保存
+            pass
+
+    def on_save():
+        nonlocal cfg_path
+        text = textbox.get("1.0", tk.END).strip()
+        try:
+            new_cfg = json.loads(text)
+        except Exception as e:
+            messagebox.showerror("JSON 格式错误", f"配置不是合法 JSON，无法保存。\n\n{e}")
+            return
+
+        # 写入到当前实际配置文件路径；如果当前文件不存在，默认写到 ./config.json
+        if not cfg_path.exists():
+            cfg_path = Path("config.json")
+
+        try:
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(json.dumps(new_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("保存失败", f"写入配置文件失败：{cfg_path}\n\n{e}")
+            return
+
+        # 更新内存 config 并同步 UI
+        try:
+            global config
+            config = new_cfg
+        except Exception:
+            pass
+
+        _try_sync_ui_from_config()
+        messagebox.showinfo("已保存", f"配置已保存到：{cfg_path}")
+
+    def on_reload():
+        try:
+            new_cfg = load_config()
+        except Exception as e:
+            messagebox.showerror("重载失败", str(e))
+            return
+        textbox.delete("1.0", tk.END)
+        textbox.insert("1.0", json.dumps(new_cfg, ensure_ascii=False, indent=2))
+
+    # 底部按钮
+    btns = ctk.CTkFrame(win)
+    btns.pack(fill="x", padx=12, pady=(0, 12))
+    ctk.CTkButton(btns, text="重载", width=90, command=on_reload).pack(side="left")
+    ctk.CTkButton(btns, text="保存", width=90, fg_color="#4CAF50", text_color="white", command=on_save).pack(side="right")
+    ctk.CTkButton(btns, text="关闭", width=90, command=win.destroy).pack(side="right", padx=8)
+
+
 # ================= 主逻辑 =================
 def start_processing():
     def task():
@@ -338,6 +472,9 @@ top_frame.pack(side="top", fill="x", padx=5, pady=5)
 ctk.CTkLabel(top_frame, text="功能选择:", text_color="gray").pack(side="left", padx=5)
 ctk.CTkButton(top_frame, text="图片转作文", width=100, command=lambda: show_page("ocr")).pack(side="left", padx=3)
 ctk.CTkButton(top_frame, text="docx作文处理", width=100, command=lambda: show_page("ai")).pack(side="left", padx=3)
+
+# 右上角：配置编辑（打开 JSON 配置的统一编辑窗口）
+ctk.CTkButton(top_frame, text="配置编辑", width=100, command=lambda: open_config_editor()).pack(side="right", padx=3)
 
 # ========== PAGE 1: OCR 处理 ==========
 page1 = ctk.CTkScrollableFrame(root)
