@@ -18,11 +18,11 @@ from openai import OpenAI
 from PIL import Image, ImageTk
 
 
-CONFIG_FILE = Path(os.environ.get("OCR_CONFIG_FILE", r"D:\person_data\ocer助手\presson.json")).expanduser()
-# 回退：CONFIG_FILE 可能会被环境变量 OCR_CONFIG_FILE 覆盖
-# 或者当配置文件缺失时，load_config 会使用本地 './config.json'。
+# 默认使用项目目录下的 config.json；如需覆盖，可通过环境变量 OCR_CONFIG_FILE 指定。
+CONFIG_FILE = Path(os.environ.get("OCR_CONFIG_FILE", "config.json")).expanduser()
 
-# ================= 默认配置 =================
+# ================= 默认配置（旧结构） =================
+# 说明：GUI 启动时会通过 ensure_new_schema() 将旧结构映射为新结构（LLM.PROVIDERS/TASKS、OCR.XFYUN）。
 DEFAULT_CONFIG = {
     "OCR": {
         "URL": "http://webapi.xfyun.cn/v1/service/v1/ocr/handwriting",
@@ -35,35 +35,26 @@ DEFAULT_CONFIG = {
         "ENABLED": False,
         "API_KEY": "",
         "MODEL": "deepseek-chat",
-        "BASE_URL": "https://api.deepseek.com",
-        "PROMPT": 
-                  "{text}"
+        "BASE_URL": "https://api.deepseek.com/v1",
+        "PROMPT": "{text}"
     },
     "EDITOR": {
         "ENABLED": False,
         "API_KEY": "",
         "MODEL": "deepseek-chat",
-        "BASE_URL": "https://api.deepseek.com",
-        "PROMPT": "下面是一篇中文文章，请你帮我修改以下问题：\n"
+        "BASE_URL": "https://api.deepseek.com/v1",
+        "PROMPT": "{text}"
     },
     "APP": {
         "ROOT_DIR": "",
         "DEBUG": False
     }
-    ,
-    "API_PROVIDERS": {
-        "Custom": "",
-        "DeepSeek": "https://api.deepseek.com",
-        "OpenAI": "https://api.openai.com/v1"
-    },
-    "AI_PROCESS": {
-        "API_KEY": "",
-        "BASE_URL": "https://api.deepseek.com",
-        "PROMPT": "下面是一篇中文文章，请你【只修改错别字和明显的识别错误】。\n要求：\n1. 不改变原意\n2. 不润色文风\n3. 不增删内容\n4. 保持原有段落结构\n5. 只输出修改后的完整文章正文\n"
-    }
 }
 
 # ================= 配置文件 =================
+from config_migrate import ensure_new_schema
+
+
 def load_config(path: Path = None):
     """
     从 JSON 文件加载配置。
@@ -99,181 +90,121 @@ def append_log(message: str):
     log_text.see(tk.END)
     log_text.configure(state="disabled")
 
-# ================= 配置编辑窗口 =================
+# ================= 配置编辑窗口（表单） =================
+from config_editor_ui import open_config_editor_form
+
+
 def open_config_editor():
-    """弹出一个窗口，读取当前保存的配置文件，允许统一编辑 JSON 并保存。
+    def _on_saved(new_cfg):
+        # 更新内存 config，并尽量刷新主页面输入框
+        global config
+        config = ensure_new_schema(new_cfg)
+        try:
+            url_entry.delete(0, tk.END)
+            url_entry.insert(0, config.get("OCR", {}).get("XFYUN", {}).get("URL", ""))
+            appid_entry.delete(0, tk.END)
+            appid_entry.insert(0, config.get("OCR", {}).get("XFYUN", {}).get("APPID", ""))
+            path_entry.delete(0, tk.END)
+            path_entry.insert(0, config.get("APP", {}).get("ROOT_DIR", ""))
 
-    设计目标：
-    - 不改动现有 UI 字段逻辑，只提供一个“高级/统一入口”
-    - 保存后刷新内存中的 config，并尽可能同步到当前页面的输入框
-    """
-    win = ctk.CTkToplevel(root)
-    win.title("配置编辑")
-    win.geometry("900x650")
+            # 开关/提示词
+            use_deepseek_var.set(bool((config.get("LLM", {}).get("TASKS", {}).get("typo_fix", {}) or {}).get("ENABLED", False)))
+            prompt_text.delete("1.0", tk.END)
+            prompt_text.insert("1.0", (config.get("LLM", {}).get("TASKS", {}).get("typo_fix", {}) or {}).get("PROMPT", "{text}"))
 
-    # 让窗口位于主窗口之上
-    try:
-        win.transient(root)
-        win.grab_set()
-    except Exception:
-        pass
+            use_editor_var.set(bool((config.get("LLM", {}).get("TASKS", {}).get("editor", {}) or {}).get("ENABLED", False)))
+            editor_prompt_text.delete("1.0", tk.END)
+            editor_prompt_text.insert("1.0", (config.get("LLM", {}).get("TASKS", {}).get("editor", {}) or {}).get("PROMPT", "{text}"))
+        except Exception:
+            pass
 
-    # 顶部提示
-    tip = (
-        "在此直接编辑配置文件内容（JSON）。\n"
-        "保存后会写入配置文件，并同步刷新当前界面。\n"
-        "注意：JSON 格式必须正确，否则无法保存。"
+    open_config_editor_form(
+        root=root,
+        config=config,
+        config_file=CONFIG_FILE,
+        hidden_api_keys=hidden_api_keys,
+        make_mask_widget=make_mask_widget,
+        reveal_entry=reveal_entry,
+        on_saved=_on_saved,
     )
-    ctk.CTkLabel(win, text=tip, text_color="gray").pack(anchor="w", padx=12, pady=(12, 6))
-
-    # 编辑区
-    textbox = ctk.CTkTextbox(win)
-    textbox.pack(fill="both", expand=True, padx=12, pady=8)
-
-    # 读取当前配置（尽量从 CONFIG_FILE / fallback 的实际文件读）
-    cfg_path = Path(CONFIG_FILE)
-    if not cfg_path.exists():
-        local = Path("config.json")
-        if local.exists():
-            cfg_path = local
-
-    raw_text = ""
-    if cfg_path.exists():
-        try:
-            raw_text = cfg_path.read_text(encoding="utf-8")
-        except Exception as e:
-            raw_text = json.dumps(config, ensure_ascii=False, indent=2)
-            messagebox.showwarning("读取配置失败", f"读取 {cfg_path} 失败，将展示当前内存配置。\n原因：{e}")
-    else:
-        raw_text = json.dumps(config, ensure_ascii=False, indent=2)
-
-    textbox.insert("1.0", raw_text)
-
-    def _try_sync_ui_from_config():
-        """把内存 config 尽量同步到页面输入框（不强制覆盖隐藏 key 的遮罩逻辑）。"""
-        try:
-            # OCR
-            if 'url_entry' in globals():
-                url_entry.delete(0, tk.END)
-                url_entry.insert(0, config.get('OCR', {}).get('URL', ''))
-            if 'appid_entry' in globals():
-                appid_entry.delete(0, tk.END)
-                appid_entry.insert(0, config.get('OCR', {}).get('APPID', ''))
-            # 路径
-            if 'path_entry' in globals():
-                path_entry.delete(0, tk.END)
-                path_entry.insert(0, config.get('APP', {}).get('ROOT_DIR', ''))
-            # DeepSeek
-            if 'use_deepseek_var' in globals():
-                use_deepseek_var.set(bool(config.get('DEEPSEEK', {}).get('ENABLED', False)))
-            if 'deepseek_base_entry' in globals():
-                deepseek_base_entry.delete(0, tk.END)
-                deepseek_base_entry.insert(0, config.get('DEEPSEEK', {}).get('BASE_URL', ''))
-            if 'prompt_text' in globals():
-                prompt_text.delete('1.0', tk.END)
-                prompt_text.insert('1.0', config.get('DEEPSEEK', {}).get('PROMPT', ''))
-
-            # EDITOR
-            if 'use_editor_var' in globals():
-                use_editor_var.set(bool(config.get('EDITOR', {}).get('ENABLED', False)))
-            if 'editor_base_entry' in globals():
-                editor_base_entry.delete(0, tk.END)
-                editor_base_entry.insert(0, config.get('EDITOR', {}).get('BASE_URL', ''))
-            if 'editor_prompt_text' in globals():
-                editor_prompt_text.delete('1.0', tk.END)
-                editor_prompt_text.insert('1.0', config.get('EDITOR', {}).get('PROMPT', ''))
-        except Exception:
-            # 同步失败不影响保存
-            pass
-
-    def on_save():
-        nonlocal cfg_path
-        text = textbox.get("1.0", tk.END).strip()
-        try:
-            new_cfg = json.loads(text)
-        except Exception as e:
-            messagebox.showerror("JSON 格式错误", f"配置不是合法 JSON，无法保存。\n\n{e}")
-            return
-
-        # 写入到当前实际配置文件路径；如果当前文件不存在，默认写到 ./config.json
-        if not cfg_path.exists():
-            cfg_path = Path("config.json")
-
-        try:
-            cfg_path.parent.mkdir(parents=True, exist_ok=True)
-            cfg_path.write_text(json.dumps(new_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            messagebox.showerror("保存失败", f"写入配置文件失败：{cfg_path}\n\n{e}")
-            return
-
-        # 更新内存 config 并同步 UI
-        try:
-            global config
-            config = new_cfg
-        except Exception:
-            pass
-
-        _try_sync_ui_from_config()
-        messagebox.showinfo("已保存", f"配置已保存到：{cfg_path}")
-
-    def on_reload():
-        try:
-            new_cfg = load_config()
-        except Exception as e:
-            messagebox.showerror("重载失败", str(e))
-            return
-        textbox.delete("1.0", tk.END)
-        textbox.insert("1.0", json.dumps(new_cfg, ensure_ascii=False, indent=2))
-
-    # 底部按钮
-    btns = ctk.CTkFrame(win)
-    btns.pack(fill="x", padx=12, pady=(0, 12))
-    ctk.CTkButton(btns, text="重载", width=90, command=on_reload).pack(side="left")
-    ctk.CTkButton(btns, text="保存", width=90, fg_color="#4CAF50", text_color="white", command=on_save).pack(side="right")
-    ctk.CTkButton(btns, text="关闭", width=90, command=win.destroy).pack(side="right", padx=8)
 
 
 # ================= 主逻辑 =================
 def start_processing():
     def task():
-        # ---------- 从 UI 读取 ----------
-        config["OCR"]["URL"] = url_entry.get().strip()
-        config["OCR"]["APPID"] = appid_entry.get().strip()
-        config["OCR"]["API_KEY"] = get_api_key_value('ocr') or ""
+        # ---------- 从 UI 读取（新 schema） ----------
+        config.setdefault("OCR", {})
+        config["OCR"].setdefault("XFYUN", {})
+        config["OCR"]["PROVIDER"] = "xfyun_handwriting"
+        config["OCR"]["XFYUN"]["URL"] = url_entry.get().strip()
+        config["OCR"]["XFYUN"]["APPID"] = appid_entry.get().strip()
+        config["OCR"]["XFYUN"]["API_KEY"] = get_api_key_value('ocr') or ""
+        config["OCR"]["XFYUN"]["LANGUAGE"] = config["OCR"]["XFYUN"].get("LANGUAGE", "cn|en")
+        config["OCR"]["XFYUN"]["LOCATION"] = config["OCR"]["XFYUN"].get("LOCATION", "false")
+
+        config.setdefault("APP", {})
         config["APP"]["ROOT_DIR"] = path_entry.get().strip()
-        config["DEEPSEEK"]["API_KEY"] = get_api_key_value('deepseek') or ""
-        config["DEEPSEEK"]["ENABLED"] = use_deepseek_var.get()
-        # DeepSeek base URL: 如果选择了预设提供商，使用其 URL，否则使用自定义输入
-        deepseek_choice = deepseek_provider_menu.get()
-        if deepseek_choice and deepseek_choice != "Custom":
-            config["DEEPSEEK"]["BASE_URL"] = API_PROVIDERS.get(deepseek_choice, "")
+
+        config.setdefault("LLM", {})
+        config["LLM"].setdefault("PROVIDERS", {})
+        config["LLM"].setdefault("TASKS", {})
+
+        # typo_fix task/provider
+        typo_provider = deepseek_provider_menu.get() or "deepseek"
+        if typo_provider == "Custom":
+            typo_provider = "custom"
+        elif typo_provider.lower() == "openai":
+            typo_provider = "openai"
         else:
-            config["DEEPSEEK"]["BASE_URL"] = deepseek_base_entry.get().strip()
-        config["DEEPSEEK"]["PROMPT"] = prompt_text.get("1.0", tk.END).strip()
-        # 第二步 API 配置
-        config.setdefault("EDITOR", {})
-        config["EDITOR"]["ENABLED"] = use_editor_var.get()
-        config["EDITOR"]["API_KEY"] = get_api_key_value('editor') or ""
-        editor_choice = editor_provider_menu.get()
-        if editor_choice and editor_choice != "Custom":
-            config["EDITOR"]["BASE_URL"] = API_PROVIDERS.get(editor_choice, "")
+            typo_provider = "deepseek"
+
+        config["LLM"]["PROVIDERS"].setdefault(typo_provider, {})
+        config["LLM"]["PROVIDERS"][typo_provider]["API_KEY"] = get_api_key_value('deepseek') or ""
+        config["LLM"]["PROVIDERS"][typo_provider]["BASE_URL"] = deepseek_base_entry.get().strip()
+        config["LLM"]["PROVIDERS"][typo_provider].setdefault("MODEL", "deepseek-chat" if typo_provider == "deepseek" else "gpt-4o-mini")
+
+        config["LLM"]["TASKS"].setdefault("typo_fix", {})
+        config["LLM"]["TASKS"]["typo_fix"]["ENABLED"] = use_deepseek_var.get()
+        config["LLM"]["TASKS"]["typo_fix"]["PROVIDER"] = typo_provider
+        config["LLM"]["TASKS"]["typo_fix"]["PROMPT"] = prompt_text.get("1.0", tk.END).strip()
+
+        # editor task/provider
+        editor_provider = editor_provider_menu.get() or "deepseek"
+        if editor_provider == "Custom":
+            editor_provider = "custom"
+        elif editor_provider.lower() == "openai":
+            editor_provider = "openai"
         else:
-            config["EDITOR"]["BASE_URL"] = editor_base_entry.get().strip()
-        config["EDITOR"]["PROMPT"] = editor_prompt_text.get("1.0", tk.END).strip()
+            editor_provider = "deepseek"
+
+        config["LLM"]["PROVIDERS"].setdefault(editor_provider, {})
+        config["LLM"]["PROVIDERS"][editor_provider]["API_KEY"] = get_api_key_value('editor') or ""
+        config["LLM"]["PROVIDERS"][editor_provider]["BASE_URL"] = editor_base_entry.get().strip()
+        config["LLM"]["PROVIDERS"][editor_provider].setdefault("MODEL", "deepseek-chat" if editor_provider == "deepseek" else "gpt-4o-mini")
+
+        config["LLM"]["TASKS"].setdefault("editor", {})
+        config["LLM"]["TASKS"]["editor"]["ENABLED"] = use_editor_var.get()
+        config["LLM"]["TASKS"]["editor"]["PROVIDER"] = editor_provider
+        config["LLM"]["TASKS"]["editor"]["PROMPT"] = editor_prompt_text.get("1.0", tk.END).strip()
 
         # ---------- 校验 ----------
         if not all([
-            config["OCR"]["URL"],
-            config["OCR"]["APPID"],
-            config["OCR"]["API_KEY"],
-            config["APP"]["ROOT_DIR"]
+            config.get("OCR", {}).get("XFYUN", {}).get("URL"),
+            config.get("OCR", {}).get("XFYUN", {}).get("APPID"),
+            config.get("OCR", {}).get("XFYUN", {}).get("API_KEY"),
+            config.get("APP", {}).get("ROOT_DIR"),
         ]):
             append_log("❌ 请填写完整的 OCR 配置和文件夹路径")
             return
 
-        if config["DEEPSEEK"]["ENABLED"] and not config["DEEPSEEK"]["API_KEY"]:
-            append_log("❌ 已启用 DeepSeek，但未填写 API Key")
-            return
+        # 校验：启用 typo_fix 时必须有对应 provider 的 API Key
+        tasks = (config.get("LLM", {}) or {}).get("TASKS", {})
+        providers = (config.get("LLM", {}) or {}).get("PROVIDERS", {})
+        if bool(tasks.get("typo_fix", {}).get("ENABLED", False)):
+            p_name = tasks.get("typo_fix", {}).get("PROVIDER")
+            if not (providers.get(p_name, {}) or {}).get("API_KEY"):
+                append_log("❌ 已启用 AI 错别字修正，但未填写 API Key")
+                return
 
         if not os.path.isdir(config["APP"]["ROOT_DIR"]):
             append_log("❌ 文件夹路径无效")
@@ -282,10 +213,10 @@ def start_processing():
         save_config(config)
 
         # ---------- 日志 ----------
-        if config["DEEPSEEK"]["ENABLED"]:
-            append_log("🧠 DeepSeek 错别字修正：已启用")
+        if bool(tasks.get("typo_fix", {}).get("ENABLED", False)):
+            append_log("🧠 AI 错别字修正：已启用")
         else:
-            append_log("🧠 DeepSeek 错别字修正：未启用")
+            append_log("🧠 AI 错别字修正：未启用")
 
         try:
             append_log("🚀 开始处理...")
@@ -294,14 +225,8 @@ def start_processing():
             process_all(
                 config["APP"]["ROOT_DIR"],
                 log_callback=append_log,
-                use_deepseek=config["DEEPSEEK"]["ENABLED"],
-                deepseek_api_key=config["DEEPSEEK"]["API_KEY"],
-                deepseek_base_url=config["DEEPSEEK"].get("BASE_URL"),
-                deepseek_prompt_template=config["DEEPSEEK"].get("PROMPT"),
-                use_editor=config.get("EDITOR", {}).get("ENABLED", False),
-                editor_api_key=config.get("EDITOR", {}).get("API_KEY"),
-                editor_base_url=config.get("EDITOR", {}).get("BASE_URL"),
-                editor_prompt_template=config.get("EDITOR", {}).get("PROMPT")
+                use_typo_fix=bool(tasks.get("typo_fix", {}).get("ENABLED", False)),
+                use_editor=bool(tasks.get("editor", {}).get("ENABLED", False)),
             )
 
             append_log("✅ 全部处理完成")
@@ -335,7 +260,7 @@ def iter_files_limited(folder, max_depth=4):
         yield root, files
 
 # ================= UI =================
-config = load_config()
+config = ensure_new_schema(load_config())
 
 # 存储已隐藏的 API Key
 hidden_api_keys = {}
@@ -485,7 +410,7 @@ ocr_frame = ctk.CTkFrame(page1)
 ocr_frame.pack(padx=10, fill="x")
 ctk.CTkLabel(ocr_frame, text="OCR 接口 URL").pack(side="left", padx=(0, 8))
 url_entry = ctk.CTkEntry(ocr_frame)
-url_entry.insert(0, config["OCR"]["URL"])
+url_entry.insert(0, config.get("OCR", {}).get("XFYUN", {}).get("URL", ""))
 url_entry.pack(side="left", fill="x", expand=True)
 
 # APPID 与 API_KEY 同行布局
@@ -493,18 +418,18 @@ appid_frame = ctk.CTkFrame(page1)
 appid_frame.pack(padx=10, fill="x")
 ctk.CTkLabel(appid_frame, text="APPID").pack(side="left", padx=(0, 8))
 appid_entry = ctk.CTkEntry(appid_frame)
-appid_entry.insert(0, config["OCR"]["APPID"])
+appid_entry.insert(0, config.get("OCR", {}).get("XFYUN", {}).get("APPID", ""))
 appid_entry.pack(side="left", fill="x", expand=True)
 
 apikey_frame = ctk.CTkFrame(page1)
 apikey_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(apikey_frame, text="API_KEY").pack(side="left", padx=(0, 8))
 apikey_entry = ctk.CTkEntry(apikey_frame)
-apikey_entry.insert(0, config["OCR"]["API_KEY"])
+apikey_entry.insert(0, config.get("OCR", {}).get("XFYUN", {}).get("API_KEY", ""))
 apikey_entry.pack(side="left", fill="x", expand=True)
 entries_map['ocr'] = apikey_entry
-if config["OCR"].get("API_KEY"):
-    hidden_api_keys['ocr'] = config["OCR"]["API_KEY"]
+if config.get("OCR", {}).get("XFYUN", {}).get("API_KEY"):
+    hidden_api_keys['ocr'] = config.get("OCR", {}).get("XFYUN", {}).get("API_KEY", "")
     apikey_entry.destroy()
     mask = make_mask_widget('ocr', apikey_frame)
     mask.pack(side="left")
@@ -515,30 +440,31 @@ deepseek_frame = ctk.CTkFrame(page1)
 deepseek_frame.pack(padx=10, fill="x", pady=(10,0))
 ctk.CTkLabel(deepseek_frame, text="AI API Key（输入AI的apikey）").pack(side="left", padx=(0,8))
 deepseek_entry = ctk.CTkEntry(deepseek_frame)
-deepseek_entry.insert(0, config["DEEPSEEK"]["API_KEY"])
+deepseek_entry.insert(0, (config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("API_KEY", ""))
 deepseek_entry.pack(side="left", fill="x", expand=True)
 entries_map['deepseek'] = deepseek_entry
-if config["DEEPSEEK"].get("API_KEY"):
-    hidden_api_keys['deepseek'] = config["DEEPSEEK"]["API_KEY"]
+# 如果已配置 provider 的 API_KEY，则默认隐藏显示
+if (config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("API_KEY"):
+    hidden_api_keys['deepseek'] = (config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("API_KEY", "")
     deepseek_entry.destroy()
     mask = make_mask_widget('deepseek', deepseek_frame)
     mask.pack(side="left")
     entries_map['deepseek'] = None
 
-use_deepseek_var = tk.BooleanVar(value=config["DEEPSEEK"]["ENABLED"])
+use_deepseek_var = tk.BooleanVar(value=bool((config.get("LLM", {}).get("TASKS", {}).get("typo_fix", {}) or {}).get("ENABLED", False)))
 ctk.CTkCheckBox(deepseek_frame, text="启用 AI 错别字自动修正（较慢）", variable=use_deepseek_var).pack(side="left", padx=8)
 
 # DeepSeek Base URL 同行
 deepseek_base_frame = ctk.CTkFrame(page1)
 deepseek_base_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(deepseek_base_frame, text="AI 改错别字（Base URL）").pack(side="left", padx=(0,8))
-deepseek_provider_name = _find_provider_name_by_url(config["DEEPSEEK"].get("BASE_URL", ""))
+deepseek_provider_name = _find_provider_name_by_url((config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("BASE_URL", ""))
 deepseek_provider_menu = ctk.CTkOptionMenu(deepseek_base_frame, values=list(API_PROVIDERS.keys()))
 deepseek_provider_menu.set(deepseek_provider_name)
 deepseek_provider_menu.pack(side="left", padx=(0,8))
 
 deepseek_base_entry = ctk.CTkEntry(deepseek_base_frame)
-deepseek_base_entry.insert(0, config["DEEPSEEK"].get("BASE_URL", ""))
+deepseek_base_entry.insert(0, (config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("BASE_URL", ""))
 deepseek_base_entry.pack(side="left", fill="x", expand=True)
 
 def _on_deepseek_provider_change(choice):
@@ -558,11 +484,15 @@ prompt_frame = ctk.CTkFrame(page1)
 prompt_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(prompt_frame, text="自定义修改错别字提示词").pack(side="left", padx=(0,8), anchor="n")
 prompt_text = ctk.CTkTextbox(prompt_frame, height=140)
-prompt_text.insert("1.0", config["DEEPSEEK"].get("PROMPT") or DEFAULT_CONFIG["DEEPSEEK"]["PROMPT"])
+prompt_text.insert(
+    "1.0",
+    (config.get("LLM", {}).get("TASKS", {}).get("typo_fix", {}) or {}).get("PROMPT")
+    or DEFAULT_CONFIG["DEEPSEEK"]["PROMPT"],
+)
 prompt_text.pack(side="left", fill="x", expand=True)
 
 # 编辑 API（第二步）
-use_editor_var = tk.BooleanVar(value=config.get("EDITOR", {}).get("ENABLED", False))
+use_editor_var = tk.BooleanVar(value=bool((config.get("LLM", {}).get("TASKS", {}).get("editor", {}) or {}).get("ENABLED", False)))
 editor_enable_frame = ctk.CTkFrame(page1)
 editor_enable_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkCheckBox(editor_enable_frame, text="启用 第二步 修改作文", variable=use_editor_var).pack(side="left")
@@ -572,11 +502,11 @@ editor_key_frame = ctk.CTkFrame(page1)
 editor_key_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(editor_key_frame, text="第二步 AI API Key（输入AI的apikey）").pack(side="left", padx=(0,8))
 editor_key_entry = ctk.CTkEntry(editor_key_frame)
-editor_key_entry.insert(0, config.get("EDITOR", {}).get("API_KEY", ""))
+editor_key_entry.insert(0, (config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("API_KEY", ""))
 editor_key_entry.pack(side="left", fill="x", expand=True)
 entries_map['editor'] = editor_key_entry
-if config.get("EDITOR", {}).get("API_KEY"):
-    hidden_api_keys['editor'] = config.get("EDITOR", {}).get("API_KEY")
+if (config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("API_KEY"):
+    hidden_api_keys['editor'] = (config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("API_KEY", "")
     editor_key_entry.destroy()
     mask = make_mask_widget('editor', editor_key_frame)
     mask.pack(side="left")
@@ -586,13 +516,13 @@ if config.get("EDITOR", {}).get("API_KEY"):
 editor_base_frame = ctk.CTkFrame(page1)
 editor_base_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(editor_base_frame, text="第二步 API Base URL（可选）").pack(side="left", padx=(0,8))
-editor_provider_name = _find_provider_name_by_url(config.get("EDITOR", {}).get("BASE_URL", ""))
+editor_provider_name = _find_provider_name_by_url((config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("BASE_URL", ""))
 editor_provider_menu = ctk.CTkOptionMenu(editor_base_frame, values=list(API_PROVIDERS.keys()))
 editor_provider_menu.set(editor_provider_name)
 editor_provider_menu.pack(side="left", padx=(0,8))
 
 editor_base_entry = ctk.CTkEntry(editor_base_frame)
-editor_base_entry.insert(0, config.get("EDITOR", {}).get("BASE_URL", ""))
+editor_base_entry.insert(0, (config.get("LLM", {}).get("PROVIDERS", {}).get("deepseek", {}) or {}).get("BASE_URL", ""))
 editor_base_entry.pack(side="left", fill="x", expand=True)
 
 def _on_editor_provider_change(choice):
@@ -612,7 +542,11 @@ editor_prompt_frame = ctk.CTkFrame(page1)
 editor_prompt_frame.pack(padx=10, fill="x", pady=(6,0))
 ctk.CTkLabel(editor_prompt_frame, text="第二步 自定义 Prompt（可选）").pack(side="left", padx=(0,8), anchor="n")
 editor_prompt_text = ctk.CTkTextbox(editor_prompt_frame, height=140)
-editor_prompt_text.insert("1.0", config.get("EDITOR", {}).get("PROMPT") or DEFAULT_CONFIG["EDITOR"]["PROMPT"])
+editor_prompt_text.insert(
+    "1.0",
+    (config.get("LLM", {}).get("TASKS", {}).get("editor", {}) or {}).get("PROMPT")
+    or DEFAULT_CONFIG["EDITOR"]["PROMPT"],
+)
 editor_prompt_text.pack(side="left", fill="x", expand=True)
 
 # 路径
@@ -665,7 +599,7 @@ ai_key_frame = ctk.CTkFrame(page2)
 ai_key_frame.pack(padx=10, fill="x", pady=(6, 0))
 ctk.CTkLabel(ai_key_frame, text="AI API Key").pack(side="left", padx=(0, 8))
 ai_key_entry = ctk.CTkEntry(ai_key_frame, show="*")
-ai_key_entry.insert(0, config.get("AI_PROCESS", {}).get("API_KEY", ""))
+ai_key_entry.insert(0, (config.get("LLM", {}).get("PROVIDERS", {}).get("custom", {}) or {}).get("API_KEY", ""))
 ai_key_entry.pack(side="left", fill="x", expand=True)
 
 # Base URL
@@ -673,7 +607,7 @@ ai_url_frame = ctk.CTkFrame(page2)
 ai_url_frame.pack(padx=10, fill="x", pady=(6, 0))
 ctk.CTkLabel(ai_url_frame, text="API Base URL").pack(side="left", padx=(0, 8))
 ai_url_entry = ctk.CTkEntry(ai_url_frame)
-ai_url_entry.insert(0, config.get("AI_PROCESS", {}).get("BASE_URL", "https://api.deepseek.com"))
+ai_url_entry.insert(0, (config.get("LLM", {}).get("PROVIDERS", {}).get("custom", {}) or {}).get("BASE_URL", ""))
 ai_url_entry.pack(side="left", fill="x", expand=True)
 
 # Prompt
@@ -681,7 +615,10 @@ ai_prompt_frame = ctk.CTkFrame(page2)
 ai_prompt_frame.pack(padx=10, fill="x", pady=(6, 0))
 ctk.CTkLabel(ai_prompt_frame, text="AI Prompt").pack(side="left", padx=(0, 8), anchor="n")
 ai_prompt_text = ctk.CTkTextbox(ai_prompt_frame, height=80)
-ai_prompt_text.insert("1.0", config.get("AI_PROCESS", {}).get("PROMPT", DEFAULT_CONFIG["AI_PROCESS"]["PROMPT"]))
+ai_prompt_text.insert(
+    "1.0",
+    (config.get("LLM", {}).get("TASKS", {}).get("editor", {}) or {}).get("PROMPT", "{text}"),
+)
 ai_prompt_text.pack(side="left", fill="x", expand=True)
 
 # 任务流标签框架 - 可拖动和排序
@@ -861,7 +798,7 @@ def start_ai_workflow():
     def task():
         folder = ai_path_entry.get().strip()
         api_key = ai_key_entry.get().strip()
-        base_url = ai_url_entry.get().strip() or "https://api.deepseek.com"
+        base_url = ai_url_entry.get().strip()
         prompt = ai_prompt_text.get("1.0", tk.END).strip() or None
         
         if not folder or not api_key:
@@ -872,11 +809,21 @@ def start_ai_workflow():
             append_log_ai("❌ 文件夹路径无效")
             return
         
-        # 保存配置
-        config.setdefault("AI_PROCESS", {})
-        config["AI_PROCESS"]["API_KEY"] = api_key
-        config["AI_PROCESS"]["BASE_URL"] = base_url
-        config["AI_PROCESS"]["PROMPT"] = prompt
+        # 保存配置（复用 editor 任务 + custom provider）
+        config.setdefault("LLM", {})
+        config["LLM"].setdefault("PROVIDERS", {})
+        config["LLM"].setdefault("TASKS", {})
+
+        config["LLM"]["PROVIDERS"].setdefault("custom", {})
+        config["LLM"]["PROVIDERS"]["custom"]["API_KEY"] = api_key
+        config["LLM"]["PROVIDERS"]["custom"]["BASE_URL"] = base_url
+        config["LLM"]["PROVIDERS"]["custom"].setdefault("MODEL", "gpt-4o-mini")
+
+        config["LLM"]["TASKS"].setdefault("editor", {})
+        config["LLM"]["TASKS"]["editor"]["PROMPT"] = prompt or "{text}"
+        config["LLM"]["TASKS"]["editor"].setdefault("ENABLED", True)
+        config["LLM"]["TASKS"]["editor"].setdefault("PROVIDER", "custom")
+
         save_config(config)
         
         append_log_ai("📋 开始处理流程...")

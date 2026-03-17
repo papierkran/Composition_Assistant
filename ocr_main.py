@@ -18,9 +18,11 @@ from openai import OpenAI
 
 import json
 
-CONFIG_FILE = Path(os.environ.get("OCR_CONFIG_FILE", r"D:\person_data\ocer助手\presson.json")).expanduser()
-# fallback: look for config.json in current folder if default missing
-# CONFIG_FILE = Path("config.json")
+from config_migrate import ensure_new_schema
+from llm_client import resolve_task_client
+
+# 默认使用项目目录下的 config.json；如需覆盖，可通过环境变量 OCR_CONFIG_FILE 指定。
+CONFIG_FILE = Path(os.environ.get("OCR_CONFIG_FILE", "config.json")).expanduser()
 
 def load_config(path: Path = None):
     """Load configuration from JSON file.
@@ -40,7 +42,7 @@ def load_config(path: Path = None):
     with cfg_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
-config = load_config()
+config = ensure_new_schema(load_config())
 
 # global debug flag driven from config (APP.DEBUG) or env
 DEBUG = bool(config.get("APP", {}).get("DEBUG", False)) or os.environ.get("OCR_DEBUG", "") != ""
@@ -52,8 +54,8 @@ else:
 
 
 
-# ========== 讯飞ocr配置区 =================================================
-OCR_CONFIG = config.get("OCR", {})
+# ========== OCR（讯飞）配置区 =================================================
+OCR_CONFIG = (config.get("OCR", {}) or {}).get("XFYUN", {})
 
 URL = OCR_CONFIG.get("URL")
 APPID = OCR_CONFIG.get("APPID")
@@ -67,15 +69,9 @@ if not all([URL, APPID, API_KEY]):
 # ==================================================================
 
 
-# ========== deepseek_api  配置区 =================================================
-DEEPSEEK_CONFIG = config.get("DEEPSEEK", {})
-
-DEEPSEEK_ENABLED = DEEPSEEK_CONFIG.get("ENABLED", False)
-DEEPSEEK_API_KEY = DEEPSEEK_CONFIG.get("API_KEY")
-DEEPSEEK_MODEL = DEEPSEEK_CONFIG.get("MODEL", "deepseek-chat")
-
-DEEPSEEK_BASE_URL = DEEPSEEK_CONFIG.get("BASE_URL", "https://api.deepseek.com")
-DEFAULT_DEEPSEEK_PROMPT = DEEPSEEK_CONFIG.get("PROMPT", (
+# ========== LLM（OpenAI-compatible）任务配置 =================================================
+# 兼容：通过 ensure_new_schema 已把旧配置映射到 LLM.PROVIDERS + LLM.TASKS
+DEFAULT_TYPO_FIX_PROMPT = (
     "下面是一篇中文文章，请你【只修改错别字和明显的识别错误】。\n"
     "要求：\n"
     "1. 不改变原意\n"
@@ -86,8 +82,7 @@ DEFAULT_DEEPSEEK_PROMPT = DEEPSEEK_CONFIG.get("PROMPT", (
     "6. 格式应该是  标题  （\\n）下一行  ——xx(替换为姓名)  然后文章内容\n"
     "标题不要出现 ‘题目：’ ‘标题：’等字样\n\n"
     "{text}"
-))
-
+)
 # ==================================================================
 
 
@@ -121,22 +116,14 @@ def _update_globals_from_config(cfg: dict):
     config file is provided at runtime.
     """
     global config, OCR_CONFIG, URL, APPID, API_KEY, language, location
-    global DEEPSEEK_CONFIG, DEEPSEEK_ENABLED, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_PROMPT
 
-    config = cfg
-    OCR_CONFIG = config.get("OCR", {})
+    config = ensure_new_schema(cfg)
+    OCR_CONFIG = (config.get("OCR", {}) or {}).get("XFYUN", {})
     URL = OCR_CONFIG.get("URL")
     APPID = OCR_CONFIG.get("APPID")
     API_KEY = OCR_CONFIG.get("API_KEY")
     language = OCR_CONFIG.get("LANGUAGE", "cn|en")
     location = OCR_CONFIG.get("LOCATION", "false")
-
-    DEEPSEEK_CONFIG = config.get("DEEPSEEK", {})
-    DEEPSEEK_ENABLED = DEEPSEEK_CONFIG.get("ENABLED", False)
-    DEEPSEEK_API_KEY = DEEPSEEK_CONFIG.get("API_KEY")
-    DEEPSEEK_MODEL = DEEPSEEK_CONFIG.get("MODEL", "deepseek-chat")
-    DEEPSEEK_BASE_URL = DEEPSEEK_CONFIG.get("BASE_URL", "https://api.deepseek.com")
-    DEFAULT_DEEPSEEK_PROMPT = DEEPSEEK_CONFIG.get("PROMPT", DEFAULT_DEEPSEEK_PROMPT)
 
 
 def main(argv=None):
@@ -165,69 +152,65 @@ def main(argv=None):
     if not root_dir:
         raise RuntimeError("未指定要处理的目录。请提供命令行参数或在配置中设置 APP.ROOT_DIR")
 
-    use_deepseek = DEEPSEEK_ENABLED and (not args.no_deepseek)
-    use_editor = config.get("EDITOR", {}).get("ENABLED", False) and (not args.no_editor)
+    # Legacy CLI flags are kept; they map to new LLM task toggles.
+    llm_tasks = (config.get("LLM", {}) or {}).get("TASKS", {})
+    typo_enabled = bool(llm_tasks.get("typo_fix", {}).get("ENABLED", False)) and (not args.no_deepseek)
+    editor_enabled = bool(llm_tasks.get("editor", {}).get("ENABLED", False)) and (not args.no_editor)
 
     process_all(
         root_dir,
         log_callback=print,
-        use_deepseek=use_deepseek,
-        deepseek_api_key=DEEPSEEK_API_KEY,
-        deepseek_base_url=DEEPSEEK_BASE_URL,
-        deepseek_prompt_template=DEFAULT_DEEPSEEK_PROMPT,
-        use_editor=use_editor,
-        editor_api_key=config.get("EDITOR", {}).get("API_KEY"),
-        editor_base_url=config.get("EDITOR", {}).get("BASE_URL"),
-        editor_prompt_template=config.get("EDITOR", {}).get("PROMPT"),
+        use_typo_fix=typo_enabled,
+        use_editor=editor_enabled,
     )
 
 
 
-# deepseek api 相关设置
-def deepseek_fix_typos(prompt_template: str, text: str, client: OpenAI) -> str:
-    """
-    调用 DeepSeek，只修改错别字，不改变原意，不润色。
+# LLM（OpenAI-compatible）相关设置
+
+def llm_fix_typos(prompt_template: str, text: str, client: OpenAI, model: str) -> str:
+    """调用 OpenAI-compatible LLM，只修改错别字，不改变原意，不润色。
+
     `prompt_template` 可以包含 `{text}` 占位符；如果没有，会把 `text` 追加到末尾。
+    是否打印 prompt/response 由 DEBUG 控制。
     """
     if not prompt_template:
-        prompt_template = DEFAULT_DEEPSEEK_PROMPT
+        prompt_template = DEFAULT_TYPO_FIX_PROMPT
 
     if "{text}" in prompt_template:
         prompt = prompt_template.format(text=text)
     else:
         prompt = prompt_template + "\n\n" + text
 
-    # Always print the prompt sent to DeepSeek to the terminal
-    print("\n=================【发送给 DeepSeek 的内容】=================\n")
-    print(prompt)
-    print("\n============================================================\n")
-
+    if DEBUG:
+        print("\n=================【发送给 LLM 的内容】=================\n")
+        print(prompt)
+        print("\n======================================================\n")
 
     response = client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": "你是一名严谨的中文校对助手"},
             {"role": "user", "content": prompt},
         ],
         temperature=0.1,
-        stream=False
+        stream=False,
     )
 
-    # Print raw response object for debugging/inspection
-    print("\n=================【DeepSeek 原始返回 response】=================\n")
-    try:
-        print(response)
-    except Exception:
-        # Fallback: safe repr
-        print(repr(response))
-    print("\n==============================================================\n")
+    if DEBUG:
+        print("\n=================【LLM 原始返回 response】=================\n")
+        try:
+            print(response)
+        except Exception:
+            print(repr(response))
+        print("\n=======================================================\n")
 
     result_text = response.choices[0].message.content.strip()
 
-    # Print the final text extracted from DeepSeek
-    print("\n=================【DeepSeek 修改后的正文】=================\n")
-    print(result_text)
-    print("\n==========================================================\n")
+    if DEBUG:
+        print("\n=================【LLM 修改后的正文】=================\n")
+        print(result_text)
+        print("\n=====================================================\n")
 
     return result_text
 
@@ -343,14 +326,8 @@ def has_images(folder_path: str) -> bool:
 # 识别图片
 def process_folder(folder_path: str,
                    log_callback=print,
-                   use_deepseek: bool = False,
-                   deepseek_api_key: str = None,
-                   deepseek_base_url: str = None,
-                   deepseek_prompt_template: str = None,
-                   use_editor: bool = False,
-                   editor_api_key: str = None,
-                   editor_base_url: str = None,
-                   editor_prompt_template: str = None):
+                   use_typo_fix: bool = False,
+                   use_editor: bool = False):
     folder_name = os.path.basename(folder_path)
     all_paragraphs = []
 
@@ -371,20 +348,20 @@ def process_folder(folder_path: str,
         # ① 先生成 Word（修改前 / 修改后 框架）
         create_word(doc_path, all_paragraphs, folder_name)
 
-        # ② 再根据开关决定是否调用 DeepSeek
-        if use_deepseek:
-            log_callback("🤖 正在调用 DeepSeek 进行错别字纠正...")
+        # ② 再根据开关决定是否调用 LLM 纠错
+        if use_typo_fix:
+            log_callback("🤖 正在调用 LLM 进行错别字纠正...")
             try:
-                fix_docx_with_deepseek(doc_path, deepseek_api_key, base_url=deepseek_base_url, prompt_template=deepseek_prompt_template)
-                log_callback("✅ DeepSeek 纠错完成")
+                fix_docx_with_llm(doc_path, task_name="typo_fix")
+                log_callback("✅ LLM 纠错完成")
             except Exception as e:
-                log_callback(f"⚠️ DeepSeek 纠错失败：{e}")
+                log_callback(f"⚠️ LLM 纠错失败：{e}")
 
-        # ③ 如果启用了第二步编辑，再把纠正后的正文送到另一个 API 处理
+        # ③ 如果启用了第二步编辑，再把纠正后的正文送到 editor 任务处理
         if use_editor:
-            log_callback("🤖 正在调用 第二步 API 进行作文改写...")
+            log_callback("🤖 正在调用 LLM 进行第二步作文改写...")
             try:
-                edit_docx_with_api(doc_path, editor_api_key, base_url=editor_base_url, prompt_template=editor_prompt_template)
+                edit_docx_with_llm(doc_path, task_name="editor")
                 log_callback("✅ 第二步改写完成")
             except Exception as e:
                 log_callback(f"⚠️ 第二步改写失败：{e}")
@@ -555,100 +532,90 @@ def insert_after_text(doc: Document, new_paragraphs):
 
 
 # ai 纠错功能
-def fix_docx_with_deepseek(docx_path: str, api_key: str, base_url: str = None, prompt_template: str = None):
-    """Use DeepSeek/OpenAI to fix typos inside the '修改前' section of the docx.
-
-    This function instantiates a temporary OpenAI client so callers don't need to manage it.
-    """
-    if not DEEPSEEK_ENABLED:
-        _LOGGER.info("DeepSeek 未启用，跳过纠错")
+def fix_docx_with_llm(docx_path: str, task_name: str = "typo_fix"):
+    """Use an OpenAI-compatible LLM to fix typos inside the '修改前' section of the docx."""
+    task_cfg = (config.get("LLM", {}) or {}).get("TASKS", {}).get(task_name, {})
+    if not bool(task_cfg.get("ENABLED", False)):
+        _LOGGER.info("LLM 纠错未启用，跳过")
         return
-
-    if not api_key:
-        _LOGGER.warning("未配置 DeepSeek API Key，跳过纠错")
-        return
-
-    client = OpenAI(api_key=api_key, base_url=(base_url or DEEPSEEK_BASE_URL))
 
     doc = Document(docx_path)
-
     before_paragraphs = extract_before_text(doc)
     if not before_paragraphs:
         _LOGGER.info("未找到修改前正文，跳过")
         return
 
     full_text = "\n".join(before_paragraphs)
-    fixed_text = deepseek_fix_typos(prompt_template, full_text, client)
 
+    client, model, prompt_template = resolve_task_client(config, task_name)
+    if not prompt_template:
+        prompt_template = DEFAULT_TYPO_FIX_PROMPT
+
+    fixed_text = llm_fix_typos(prompt_template, full_text, client, model=model)
     fixed_paragraphs = [p.strip() for p in fixed_text.split("\n") if p.strip()]
 
     clear_before_text(doc)
     insert_before_text(doc, fixed_paragraphs)
-
     doc.save(docx_path)
 
 
-def edit_docx_with_api(docx_path: str, api_key: str, base_url: str = None, prompt_template: str = None, model: str = None):
-    """
-    使用另一个 AI API（与 DeepSeek 调用逻辑一致）对已经被纠错后的文章进行进一步修改，
-    并将结果插入到“修改后：”之后。
-    """
-    if not api_key:
-        _LOGGER.warning("第二步 API 未配置 API Key，跳过")
+def edit_docx_with_llm(docx_path: str, task_name: str = "editor"):
+    """使用 OpenAI-compatible LLM 对纠错后的文章进行进一步修改，并插入到“修改后：”之后。"""
+    task_cfg = (config.get("LLM", {}) or {}).get("TASKS", {}).get(task_name, {})
+    if not bool(task_cfg.get("ENABLED", False)):
+        _LOGGER.info("第二步编辑未启用，跳过")
         return
 
-    client = OpenAI(api_key=api_key, base_url=(base_url or DEEPSEEK_BASE_URL))
+    client, model, prompt_template = resolve_task_client(config, task_name)
+
     doc = Document(docx_path)
 
-    # 读取已纠错的正文（"修改前：" 区域）
     corrected_paragraphs = extract_before_text(doc)
     if not corrected_paragraphs:
-        print("未找到可供第二步处理的正文，跳过")
+        _LOGGER.info("未找到可供第二步处理的正文，跳过")
         return
 
     full_text = "\n".join(corrected_paragraphs)
 
-    # 生成 prompt
     if not prompt_template:
-        prompt_template = DEFAULT_DEEPSEEK_PROMPT
+        prompt_template = DEFAULT_TYPO_FIX_PROMPT
 
     if "{text}" in prompt_template:
         prompt = prompt_template.format(text=full_text)
     else:
         prompt = prompt_template + "\n\n" + full_text
 
-    # Always print the prompt sent to the second-step API
-    print("\n=================【发送给 第二步 API 的内容】=================\n")
-    print(prompt)
-    print("\n============================================================\n")
+    if DEBUG:
+        print("\n=================【发送给 editor LLM 的内容】=================\n")
+        print(prompt)
+        print("\n=============================================================\n")
 
     response = client.chat.completions.create(
-        model=(model or DEEPSEEK_MODEL),
+        model=model,
         messages=[
             {"role": "system", "content": "你是一名严谨的中文写作编辑助手"},
             {"role": "user", "content": prompt},
         ],
         temperature=0.1,
-        stream=False
+        stream=False,
     )
 
-    # Print raw response and extract final text
-    print("\n=================【第二步 API 原始返回 response】=================\n")
-    try:
-        print(response)
-    except Exception:
-        print(repr(response))
-    print("\n==============================================================\n")
+    if DEBUG:
+        print("\n=================【editor LLM 原始返回 response】=================\n")
+        try:
+            print(response)
+        except Exception:
+            print(repr(response))
+        print("\n===============================================================\n")
 
     result_text = response.choices[0].message.content.strip()
 
-    # Print the edited text returned by second-step API
-    print("\n=================【第二步 API 修改后的正文】=================\n")
-    print(result_text)
-    print("\n==========================================================\n")
+    if DEBUG:
+        print("\n=================【editor LLM 修改后的正文】=================\n")
+        print(result_text)
+        print("\n============================================================\n")
 
     edited_paragraphs = [p.strip() for p in result_text.split("\n") if p.strip()]
-
     insert_after_text(doc, edited_paragraphs)
     doc.save(docx_path)
 
@@ -658,14 +625,14 @@ def edit_docx_with_api(docx_path: str, api_key: str, base_url: str = None, promp
 
 
 # 遍历文件夹识别图片
-def process_all(root_dir, log_callback=print, use_deepseek=False, deepseek_api_key=None, deepseek_base_url=None, deepseek_prompt_template=None, use_editor=False, editor_api_key=None, editor_base_url=None, editor_prompt_template=None):
+def process_all(root_dir, log_callback=print, use_typo_fix=False, use_editor=False):
     if has_images(root_dir):
-        process_folder(root_dir, log_callback, use_deepseek, deepseek_api_key, deepseek_base_url, deepseek_prompt_template, use_editor, editor_api_key, editor_base_url, editor_prompt_template)
+        process_folder(root_dir, log_callback, use_typo_fix=use_typo_fix, use_editor=use_editor)
     else:
         for sub in os.listdir(root_dir):
             sub_path = os.path.join(root_dir, sub)
             if os.path.isdir(sub_path) and has_images(sub_path):
-                process_folder(sub_path, log_callback, use_deepseek, deepseek_api_key, deepseek_base_url, deepseek_prompt_template, use_editor, editor_api_key, editor_base_url, editor_prompt_template)
+                process_folder(sub_path, log_callback, use_typo_fix=use_typo_fix, use_editor=use_editor)
 
 
 if __name__ == '__main__':
@@ -673,11 +640,11 @@ if __name__ == '__main__':
     if not os.path.isdir(ROOT_DIR):
         print("无效路径！")
     else:
+        # For interactive usage, follow config toggles.
+        tasks = (config.get("LLM", {}) or {}).get("TASKS", {})
         process_all(
             ROOT_DIR,
-            use_deepseek=DEEPSEEK_ENABLED,
-            deepseek_api_key=DEEPSEEK_API_KEY,
-            deepseek_base_url=DEEPSEEK_BASE_URL,
-            deepseek_prompt_template=DEFAULT_DEEPSEEK_PROMPT
+            use_typo_fix=bool(tasks.get("typo_fix", {}).get("ENABLED", False)),
+            use_editor=bool(tasks.get("editor", {}).get("ENABLED", False)),
         )
         print("全部处理完成！")
