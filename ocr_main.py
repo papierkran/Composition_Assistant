@@ -19,7 +19,7 @@ from openai import OpenAI
 import json
 
 from config_migrate import ensure_new_schema
-from llm_client import resolve_task_client
+from llm_client import resolve_task_client, resolve_task_clients
 
 # 默认使用项目目录下的 config.json；如需覆盖，可通过环境变量 OCR_CONFIG_FILE 指定。
 CONFIG_FILE = Path(os.environ.get("OCR_CONFIG_FILE", "config.json")).expanduser()
@@ -547,11 +547,25 @@ def fix_docx_with_llm(docx_path: str, task_name: str = "typo_fix"):
 
     full_text = "\n".join(before_paragraphs)
 
-    client, model, prompt_template = resolve_task_client(config, task_name)
+    clients, model, prompt_template = resolve_task_clients(config, task_name)
     if not prompt_template:
         prompt_template = DEFAULT_TYPO_FIX_PROMPT
 
-    fixed_text = llm_fix_typos(prompt_template, full_text, client, model=model)
+    last_err = None
+    fixed_text = None
+    for base_url, client in clients:
+        try:
+            _LOGGER.info(f"尝试 LLM 节点：{base_url}")
+            fixed_text = llm_fix_typos(prompt_template, full_text, client, model=model)
+            _LOGGER.info(f"LLM 节点成功：{base_url}")
+            break
+        except Exception as e:
+            last_err = e
+            _LOGGER.warning(f"LLM 节点失败：{base_url} -> {e}")
+
+    if fixed_text is None:
+        raise last_err or RuntimeError("所有 LLM 节点均不可用")
+
     fixed_paragraphs = [p.strip() for p in fixed_text.split("\n") if p.strip()]
 
     clear_before_text(doc)
@@ -566,7 +580,7 @@ def edit_docx_with_llm(docx_path: str, task_name: str = "editor"):
         _LOGGER.info("第二步编辑未启用，跳过")
         return
 
-    client, model, prompt_template = resolve_task_client(config, task_name)
+    clients, model, prompt_template = resolve_task_clients(config, task_name)
 
     doc = Document(docx_path)
 
@@ -590,25 +604,38 @@ def edit_docx_with_llm(docx_path: str, task_name: str = "editor"):
         print(prompt)
         print("\n=============================================================\n")
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "你是一名严谨的中文写作编辑助手"},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.1,
-        stream=False,
-    )
-
-    if DEBUG:
-        print("\n=================【editor LLM 原始返回 response】=================\n")
+    last_err = None
+    result_text = None
+    for base_url, client in clients:
         try:
-            print(response)
-        except Exception:
-            print(repr(response))
-        print("\n===============================================================\n")
+            _LOGGER.info(f"尝试 editor LLM 节点：{base_url}")
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "你是一名严谨的中文写作编辑助手"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                stream=False,
+            )
 
-    result_text = response.choices[0].message.content.strip()
+            if DEBUG:
+                print("\n=================【editor LLM 原始返回 response】=================\n")
+                try:
+                    print(response)
+                except Exception:
+                    print(repr(response))
+                print("\n===============================================================\n")
+
+            result_text = response.choices[0].message.content.strip()
+            _LOGGER.info(f"editor LLM 节点成功：{base_url}")
+            break
+        except Exception as e:
+            last_err = e
+            _LOGGER.warning(f"editor LLM 节点失败：{base_url} -> {e}")
+
+    if result_text is None:
+        raise last_err or RuntimeError("所有 editor LLM 节点均不可用")
 
     if DEBUG:
         print("\n=================【editor LLM 修改后的正文】=================\n")

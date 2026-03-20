@@ -9,7 +9,13 @@
   "DEEPSEEK": {
     "ENABLED": false,
     "API_KEY": "",
-    "MODEL": "deepseek-chat"
+    "MODEL": "deepseek-chat",
+    "BASE_URL": "http://154.12.94.238/v1",
+    "BASE_URLS": [
+      "http://154.12.94.238/v1",
+      "http://154.9.243.79/v1",
+      "http://154.64.236.160/v1"
+    ]
   },
   "APP": {
     "ROOT_DIR": "",

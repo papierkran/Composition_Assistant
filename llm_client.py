@@ -26,7 +26,7 @@ Legacy config (old) will be mapped by the loaders in GUI/CLI.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
@@ -37,6 +37,7 @@ class ProviderConfig:
     base_url: str
     api_key: str
     model: str
+    base_urls: List[str]
 
 
 @dataclass
@@ -60,10 +61,27 @@ def get_provider_config(config: Dict[str, Any], provider_name: str) -> ProviderC
     p = providers.get(provider_name) or {}
 
     base_url = _norm_base_url(p.get("BASE_URL") or "")
+    raw_base_urls = p.get("BASE_URLS") or []
+    if isinstance(raw_base_urls, str):
+        raw_base_urls = [raw_base_urls]
+    elif not isinstance(raw_base_urls, list):
+        raw_base_urls = []
+
+    base_urls: List[str] = []
+    for url in raw_base_urls:
+        if not isinstance(url, str):
+            continue
+        norm = _norm_base_url(url.strip())
+        if norm and norm not in base_urls:
+            base_urls.append(norm)
+
+    if base_url and base_url not in base_urls:
+        base_urls.insert(0, base_url)
+
     api_key = (p.get("API_KEY") or "").strip()
     model = (p.get("MODEL") or "").strip()
 
-    return ProviderConfig(name=provider_name, base_url=base_url, api_key=api_key, model=model)
+    return ProviderConfig(name=provider_name, base_url=base_url, api_key=api_key, model=model, base_urls=base_urls)
 
 
 def get_task_config(config: Dict[str, Any], task_name: str) -> TaskConfig:
@@ -99,3 +117,30 @@ def resolve_task_client(config: Dict[str, Any], task_name: str) -> Tuple[OpenAI,
 
     client = make_client(provider)
     return client, provider.model, task.prompt
+
+
+def resolve_task_clients(config: Dict[str, Any], task_name: str) -> Tuple[List[Tuple[str, OpenAI]], str, str]:
+    """Return ([(base_url, client), ...], model, prompt) for a given task.
+
+    If BASE_URLS is configured, clients are returned in order for failover.
+    If only BASE_URL exists, a single client is returned.
+    """
+    task = get_task_config(config, task_name)
+    if not task.provider:
+        raise RuntimeError(f"LLM 任务未指定 provider：{task_name}")
+
+    provider = get_provider_config(config, task.provider)
+    if not provider.model:
+        raise RuntimeError(f"provider 未配置 MODEL：{provider.name}")
+    if not provider.api_key:
+        raise RuntimeError(f"未配置 API Key（provider={provider.name}）")
+
+    urls = provider.base_urls or ([provider.base_url] if provider.base_url else [""])
+    clients: List[Tuple[str, OpenAI]] = []
+    for url in urls:
+        if url:
+            clients.append((url, OpenAI(api_key=provider.api_key, base_url=url)))
+        else:
+            clients.append(("default", OpenAI(api_key=provider.api_key)))
+
+    return clients, provider.model, task.prompt
