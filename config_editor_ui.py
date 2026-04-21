@@ -102,27 +102,32 @@ def open_config_editor_form(
         inner.pack(fill="x", expand=False)
         return inner
 
-    def row(parent, label: str, widget):
+    def row(parent, label: str):
         r = ctk.CTkFrame(parent)
         r.pack(fill="x", padx=10, pady=6)
         ctk.CTkLabel(r, text=label, width=240, anchor="w").pack(side="left")
-        widget.pack(in_=r, side="left", fill="x", expand=True)
-        return r
+        field = ctk.CTkFrame(r, fg_color="transparent")
+        field.pack(side="left", fill="x", expand=True)
+        return field
 
     # ---- OCR (XFYUN) ----
     ocr_sec = section("OCR（讯飞）")
     ocr = (cfg.get("OCR", {}) or {}).get("XFYUN", {})
 
-    ocr_url = ctk.CTkEntry(ocr_sec)
+    ocr_url_row = row(ocr_sec, "OCR URL")
+    ocr_url = ctk.CTkEntry(ocr_url_row)
     ocr_url.insert(0, ocr.get("URL", ""))
-    row(ocr_sec, "OCR URL", ocr_url)
+    ocr_url.pack(fill="x", expand=True)
 
-    ocr_appid = ctk.CTkEntry(ocr_sec)
+    ocr_appid_row = row(ocr_sec, "APPID")
+    ocr_appid = ctk.CTkEntry(ocr_appid_row)
     ocr_appid.insert(0, ocr.get("APPID", ""))
-    row(ocr_sec, "APPID", ocr_appid)
+    ocr_appid.pack(fill="x", expand=True)
 
     # API_KEY masked
-    ocr_key_frame = ctk.CTkFrame(ocr_sec)
+    ocr_key_row = row(ocr_sec, "API Key")
+    ocr_key_frame = ctk.CTkFrame(ocr_key_row, fg_color="transparent")
+    ocr_key_frame.pack(fill="x", expand=True)
     ocr_key_entry = ctk.CTkEntry(ocr_key_frame)
     ocr_key_entry.insert(0, ocr.get("API_KEY", ""))
     # reuse masking system: name 'ocr'
@@ -139,23 +144,24 @@ def open_config_editor_form(
             pass
         mask = make_mask_widget('ocr', ocr_key_frame)
         mask.pack(side="left")
-    row(ocr_sec, "API Key", ocr_key_frame)
-
-    ocr_lang = ctk.CTkEntry(ocr_sec)
+    ocr_lang_row = row(ocr_sec, "LANGUAGE")
+    ocr_lang = ctk.CTkEntry(ocr_lang_row)
     ocr_lang.insert(0, ocr.get("LANGUAGE", "cn|en"))
-    row(ocr_sec, "LANGUAGE", ocr_lang)
+    ocr_lang.pack(fill="x", expand=True)
 
-    ocr_loc = ctk.CTkEntry(ocr_sec)
+    ocr_loc_row = row(ocr_sec, "LOCATION (true/false)")
+    ocr_loc = ctk.CTkEntry(ocr_loc_row)
     ocr_loc.insert(0, str(ocr.get("LOCATION", "false")))
-    row(ocr_sec, "LOCATION (true/false)", ocr_loc)
+    ocr_loc.pack(fill="x", expand=True)
 
     # ---- APP ----
     app_sec = section("应用")
     app = cfg.get("APP", {}) or {}
 
-    root_dir = ctk.CTkEntry(app_sec)
+    root_dir_row = row(app_sec, "默认处理目录 ROOT_DIR")
+    root_dir = ctk.CTkEntry(root_dir_row)
     root_dir.insert(0, app.get("ROOT_DIR", ""))
-    row(app_sec, "默认处理目录 ROOT_DIR", root_dir)
+    root_dir.pack(fill="x", expand=True)
 
     debug_var = tk.BooleanVar(value=bool(app.get("DEBUG", False)))
     debug_cb = ctk.CTkCheckBox(app_sec, text="启用 DEBUG（会打印 prompt/response）", variable=debug_var)
@@ -178,16 +184,20 @@ def open_config_editor_form(
 
         p = providers.get(provider_name, {}) or {}
 
-        base = ctk.CTkEntry(box)
+        base_row = row(box, "BASE_URL（例：https://api.openai.com/v1）")
+        base = ctk.CTkEntry(base_row)
         base.insert(0, p.get("BASE_URL", ""))
-        row(box, "BASE_URL（例：https://api.openai.com/v1）", base)
+        base.pack(fill="x", expand=True)
 
-        model = ctk.CTkEntry(box)
+        model_row = row(box, "MODEL")
+        model = ctk.CTkEntry(model_row)
         model.insert(0, p.get("MODEL", ""))
-        row(box, "MODEL", model)
+        model.pack(fill="x", expand=True)
 
         # API key masked
-        key_frame = ctk.CTkFrame(box)
+        key_row = row(box, "API_KEY")
+        key_frame = ctk.CTkFrame(key_row, fg_color="transparent")
+        key_frame.pack(fill="x", expand=True)
         key_entry = ctk.CTkEntry(key_frame)
         key_entry.insert(0, p.get("API_KEY", ""))
         key_entry.pack(side="left", fill="x", expand=True)
@@ -199,13 +209,11 @@ def open_config_editor_form(
                 pass
             mask = make_mask_widget(key_alias, key_frame)
             mask.pack(side="left")
-        row(box, "API_KEY", key_frame)
+        return base, model, key_entry
 
-        return base, model
-
-    deepseek_base, deepseek_model = provider_block("Provider: deepseek", "deepseek", "deepseek")
-    openai_base, openai_model = provider_block("Provider: openai", "openai", "openai")
-    custom_base, custom_model = provider_block("Provider: custom", "custom", "custom")
+    deepseek_base, deepseek_model, deepseek_key_entry = provider_block("Provider: deepseek", "deepseek", "deepseek")
+    openai_base, openai_model, openai_key_entry = provider_block("Provider: openai", "openai", "openai")
+    custom_base, custom_model, custom_key_entry = provider_block("Provider: custom", "custom", "custom")
 
     def task_block(task_name: str, title: str):
         t = tasks.get(task_name, {}) or {}
@@ -217,18 +225,14 @@ def open_config_editor_form(
         ctk.CTkCheckBox(box, text="启用", variable=enabled_var).pack(anchor="w", padx=10, pady=(4, 6))
 
         prov = tk.StringVar(value=(t.get("PROVIDER") or "deepseek"))
-        prov_menu = ctk.CTkOptionMenu(box, values=provider_choices, variable=prov)
-        pr = ctk.CTkFrame(box)
-        pr.pack(fill="x", padx=10, pady=6)
-        ctk.CTkLabel(pr, text="使用 provider", width=240, anchor="w").pack(side="left")
+        prov_row = row(box, "使用 provider")
+        prov_menu = ctk.CTkOptionMenu(prov_row, values=provider_choices, variable=prov)
         prov_menu.pack(side="left")
 
-        prompt = ctk.CTkTextbox(box, height=120)
+        pfr = row(box, "PROMPT（支持 {text}）")
+        prompt = ctk.CTkTextbox(pfr, height=120)
         prompt.insert("1.0", t.get("PROMPT", "{text}"))
-        pfr = ctk.CTkFrame(box)
-        pfr.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkLabel(pfr, text="PROMPT（支持 {text}）", width=240, anchor="w").pack(side="left", anchor="n")
-        prompt.pack(in_=pfr, side="left", fill="x", expand=True)
+        prompt.pack(side="left", fill="x", expand=True)
 
         return enabled_var, prov, prompt
 
@@ -279,7 +283,7 @@ def open_config_editor_form(
         new_cfg["OCR"].setdefault("XFYUN", {})
         new_cfg["OCR"]["XFYUN"]["URL"] = ocr_url.get().strip()
         new_cfg["OCR"]["XFYUN"]["APPID"] = ocr_appid.get().strip()
-        new_cfg["OCR"]["XFYUN"]["API_KEY"] = (hidden_api_keys.get('ocr') or "").strip()
+        new_cfg["OCR"]["XFYUN"]["API_KEY"] = (hidden_api_keys.get('ocr') or ocr_key_entry.get() or "").strip()
         new_cfg["OCR"]["XFYUN"]["LANGUAGE"] = ocr_lang.get().strip() or "cn|en"
         new_cfg["OCR"]["XFYUN"]["LOCATION"] = ocr_loc.get().strip() or "false"
 
@@ -291,16 +295,18 @@ def open_config_editor_form(
         new_cfg["LLM"].setdefault("PROVIDERS", {})
         new_cfg["LLM"].setdefault("TASKS", {})
 
-        def set_provider(name: str, base_entry, model_entry, key_alias: str):
+        def set_provider(name: str, base_entry, model_entry, key_alias: str, key_entry):
             new_cfg["LLM"]["PROVIDERS"].setdefault(name, {})
             new_cfg["LLM"]["PROVIDERS"][name]["BASE_URL"] = base_entry.get().strip()
             new_cfg["LLM"]["PROVIDERS"][name]["MODEL"] = model_entry.get().strip()
             # key stored masked
-            new_cfg["LLM"]["PROVIDERS"][name]["API_KEY"] = (hidden_api_keys.get(key_alias) or "").strip()
+            new_cfg["LLM"]["PROVIDERS"][name]["API_KEY"] = (
+                hidden_api_keys.get(key_alias) or key_entry.get() or ""
+            ).strip()
 
-        set_provider("deepseek", deepseek_base, deepseek_model, "deepseek")
-        set_provider("openai", openai_base, openai_model, "openai")
-        set_provider("custom", custom_base, custom_model, "custom")
+        set_provider("deepseek", deepseek_base, deepseek_model, "deepseek", deepseek_key_entry)
+        set_provider("openai", openai_base, openai_model, "openai", openai_key_entry)
+        set_provider("custom", custom_base, custom_model, "custom", custom_key_entry)
 
         def set_task(name: str, enabled_var, provider_var, prompt_widget):
             new_cfg["LLM"]["TASKS"].setdefault(name, {})

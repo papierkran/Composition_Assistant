@@ -1,24 +1,47 @@
 {
   "OCR": {
-    "URL": "http://webapi.xfyun.cn/v1/service/v1/ocr/handwriting",
-    "APPID": "",
-    "API_KEY": "",
-    "LANGUAGE": "cn|en",
-    "LOCATION": "false"
-  },
-  "DEEPSEEK": {
-    "ENABLED": false,
-    "API_KEY": "",
-    "MODEL": "deepseek-chat",
-    "BASE_URL": "http://154.12.94.238/v1",
-    "BASE_URLS": [
-      "http://154.12.94.238/v1",
-      "http://154.9.243.79/v1",
-      "http://154.64.236.160/v1"
-    ]
+    "PROVIDER": "xfyun_handwriting",
+    "XFYUN": {
+      "URL": "http://webapi.xfyun.cn/v1/service/v1/ocr/handwriting",
+      "APPID": "",
+      "API_KEY": "",
+      "LANGUAGE": "cn|en",
+      "LOCATION": "false"
+    }
   },
   "APP": {
     "ROOT_DIR": "",
     "DEBUG": false
+  },
+  "LLM": {
+    "PROVIDERS": {
+      "deepseek": {
+        "BASE_URL": "https://api.deepseek.com",
+        "API_KEY": "",
+        "MODEL": "deepseek-chat"
+      },
+      "openai": {
+        "BASE_URL": "https://api.openai.com/v1",
+        "API_KEY": "",
+        "MODEL": "gpt-4o-mini"
+      },
+      "custom": {
+        "BASE_URL": "",
+        "API_KEY": "",
+        "MODEL": ""
+      }
+    },
+    "TASKS": {
+      "typo_fix": {
+        "ENABLED": true,
+        "PROVIDER": "deepseek",
+        "PROMPT": "{text}"
+      },
+      "editor": {
+        "ENABLED": true,
+        "PROVIDER": "deepseek",
+        "PROMPT": "{text}"
+      }
+    }
   }
 }

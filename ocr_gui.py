@@ -9,6 +9,7 @@ import os
 import subprocess
 import re
 from pathlib import Path
+from copy import deepcopy
 import customtkinter as ctk
 from docx import Document
 from docx.shared import Pt, Cm
@@ -21,29 +22,48 @@ from PIL import Image, ImageTk
 # 默认使用项目目录下的 config.json；如需覆盖，可通过环境变量 OCR_CONFIG_FILE 指定。
 CONFIG_FILE = Path(os.environ.get("OCR_CONFIG_FILE", "config.json")).expanduser()
 
-# ================= 默认配置（旧结构） =================
-# 说明：GUI 启动时会通过 ensure_new_schema() 将旧结构映射为新结构（LLM.PROVIDERS/TASKS、OCR.XFYUN）。
+# ================= 默认配置（新结构） =================
 DEFAULT_CONFIG = {
     "OCR": {
-        "URL": "http://webapi.xfyun.cn/v1/service/v1/ocr/handwriting",
-        "APPID": "",
-        "API_KEY": "",
-        "LANGUAGE": "cn|en",
-        "LOCATION": "false"
+        "PROVIDER": "xfyun_handwriting",
+        "XFYUN": {
+            "URL": "http://webapi.xfyun.cn/v1/service/v1/ocr/handwriting",
+            "APPID": "",
+            "API_KEY": "",
+            "LANGUAGE": "cn|en",
+            "LOCATION": "false",
+        },
     },
-    "DEEPSEEK": {
-        "ENABLED": False,
-        "API_KEY": "",
-        "MODEL": "deepseek-chat",
-        "BASE_URL": "https://api.deepseek.com/v1",
-        "PROMPT": "{text}"
-    },
-    "EDITOR": {
-        "ENABLED": False,
-        "API_KEY": "",
-        "MODEL": "deepseek-chat",
-        "BASE_URL": "https://api.deepseek.com/v1",
-        "PROMPT": "{text}"
+    "LLM": {
+        "PROVIDERS": {
+            "deepseek": {
+                "API_KEY": "",
+                "MODEL": "deepseek-chat",
+                "BASE_URL": "https://api.deepseek.com/v1",
+            },
+            "openai": {
+                "API_KEY": "",
+                "MODEL": "gpt-4o-mini",
+                "BASE_URL": "https://api.openai.com/v1",
+            },
+            "custom": {
+                "API_KEY": "",
+                "MODEL": "",
+                "BASE_URL": "",
+            },
+        },
+        "TASKS": {
+            "typo_fix": {
+                "ENABLED": False,
+                "PROVIDER": "deepseek",
+                "PROMPT": "{text}",
+            },
+            "editor": {
+                "ENABLED": False,
+                "PROVIDER": "deepseek",
+                "PROMPT": "{text}",
+            },
+        },
     },
     "APP": {
         "ROOT_DIR": "",
@@ -67,13 +87,13 @@ def load_config(path: Path = None):
         if local.exists():
             cfg_path = local
         else:
-            return DEFAULT_CONFIG.copy()
+            return deepcopy(DEFAULT_CONFIG)
 
     try:
         with cfg_path.open("r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return DEFAULT_CONFIG.copy()
+        return deepcopy(DEFAULT_CONFIG)
 
 def save_config(config, path: Path = None):
     """Save configuration to file. Ensures parent directory exists."""
@@ -487,7 +507,7 @@ prompt_text = ctk.CTkTextbox(prompt_frame, height=140)
 prompt_text.insert(
     "1.0",
     (config.get("LLM", {}).get("TASKS", {}).get("typo_fix", {}) or {}).get("PROMPT")
-    or DEFAULT_CONFIG["DEEPSEEK"]["PROMPT"],
+    or DEFAULT_CONFIG["LLM"]["TASKS"]["typo_fix"]["PROMPT"],
 )
 prompt_text.pack(side="left", fill="x", expand=True)
 
@@ -545,7 +565,7 @@ editor_prompt_text = ctk.CTkTextbox(editor_prompt_frame, height=140)
 editor_prompt_text.insert(
     "1.0",
     (config.get("LLM", {}).get("TASKS", {}).get("editor", {}) or {}).get("PROMPT")
-    or DEFAULT_CONFIG["EDITOR"]["PROMPT"],
+    or DEFAULT_CONFIG["LLM"]["TASKS"]["editor"]["PROMPT"],
 )
 editor_prompt_text.pack(side="left", fill="x", expand=True)
 
