@@ -17,18 +17,13 @@
     "PROVIDERS": {
       "deepseek": {
         "BASE_URL": "https://api.deepseek.com",
-        "API_KEY": "",
-        "MODEL": "deepseek-chat"
+        "MODEL": "deepseek-chat",
+        "API_KEY": ""
       },
       "openai": {
         "BASE_URL": "https://api.openai.com/v1",
-        "API_KEY": "",
-        "MODEL": "gpt-4o-mini"
-      },
-      "custom": {
-        "BASE_URL": "",
-        "API_KEY": "",
-        "MODEL": ""
+        "MODEL": "gpt-4o-mini",
+        "API_KEY": ""
       }
     },
     "TASKS": {

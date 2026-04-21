@@ -174,46 +174,156 @@ def open_config_editor_form(
     llm = cfg.get("LLM", {}) or {}
     providers = llm.get("PROVIDERS", {}) or {}
     tasks = llm.get("TASKS", {}) or {}
+    providers_state = {k: dict(v or {}) for k, v in providers.items() if isinstance(k, str)}
+    for built_in in ("deepseek", "openai"):
+        providers_state.setdefault(built_in, {})
 
-    provider_choices = ["deepseek", "openai", "custom"]
+    provider_widgets: Dict[str, Dict[str, Any]] = {}
 
-    def provider_block(title: str, provider_name: str, key_alias: str):
-        box = ctk.CTkFrame(llm_sec)
-        box.pack(fill="x", padx=10, pady=(6, 0))
-        ctk.CTkLabel(box, text=title, font=("", 13, "bold"), text_color="gray").pack(anchor="w", padx=10, pady=(8, 2))
+    provider_manage = ctk.CTkFrame(llm_sec)
+    provider_manage.pack(fill="x", padx=10, pady=(6, 0))
+    ctk.CTkLabel(provider_manage, text="Provider 管理", font=("", 13, "bold"), text_color="gray").pack(side="left")
 
-        p = providers.get(provider_name, {}) or {}
+    add_name_entry = ctk.CTkEntry(provider_manage, width=180, placeholder_text="新 provider 名称")
+    add_name_entry.pack(side="left", padx=(10, 6))
+    add_base_entry = ctk.CTkEntry(provider_manage, width=220, placeholder_text="可选 BASE_URL")
+    add_base_entry.pack(side="left", padx=(0, 6))
 
-        base_row = row(box, "BASE_URL（例：https://api.openai.com/v1）")
-        base = ctk.CTkEntry(base_row)
-        base.insert(0, p.get("BASE_URL", ""))
-        base.pack(fill="x", expand=True)
+    providers_container = ctk.CTkFrame(llm_sec)
+    providers_container.pack(fill="x", padx=10, pady=(4, 0))
 
-        model_row = row(box, "MODEL")
-        model = ctk.CTkEntry(model_row)
-        model.insert(0, p.get("MODEL", ""))
-        model.pack(fill="x", expand=True)
+    def _provider_choices() -> list[str]:
+        names = sorted({name.strip() for name in providers_state.keys() if name and name.strip()})
+        return names or ["deepseek"]
 
-        # API key masked
-        key_row = row(box, "API_KEY")
-        key_frame = ctk.CTkFrame(key_row, fg_color="transparent")
-        key_frame.pack(fill="x", expand=True)
-        key_entry = ctk.CTkEntry(key_frame)
-        key_entry.insert(0, p.get("API_KEY", ""))
-        key_entry.pack(side="left", fill="x", expand=True)
-        if p.get("API_KEY"):
-            hidden_api_keys[key_alias] = p.get("API_KEY", "")
-            try:
-                key_entry.destroy()
-            except Exception:
-                pass
-            mask = make_mask_widget(key_alias, key_frame)
-            mask.pack(side="left")
-        return base, model, key_entry
+    def _normalize_provider_name(name: str) -> str:
+        return (name or "").strip().lower()
 
-    deepseek_base, deepseek_model, deepseek_key_entry = provider_block("Provider: deepseek", "deepseek", "deepseek")
-    openai_base, openai_model, openai_key_entry = provider_block("Provider: openai", "openai", "openai")
-    custom_base, custom_model, custom_key_entry = provider_block("Provider: custom", "custom", "custom")
+    def _is_valid_provider_name(name: str) -> bool:
+        for ch in name:
+            if not (ch.isalnum() or ch in ("_", "-", ".")):
+                return False
+        return True
+
+    def _refresh_task_provider_menus():
+        names = _provider_choices()
+        typo_provider_menu.configure(values=names)
+        edit_provider_menu.configure(values=names)
+        if typo_provider.get() not in names:
+            typo_provider.set(names[0])
+        if edit_provider.get() not in names:
+            edit_provider.set(names[0])
+
+    def _render_provider_blocks():
+        nonlocal provider_widgets
+        provider_widgets = {}
+        for child in providers_container.winfo_children():
+            child.destroy()
+
+        for provider_name in _provider_choices():
+            p = providers_state.get(provider_name, {}) or {}
+            box = ctk.CTkFrame(providers_container)
+            box.pack(fill="x", pady=(6, 0))
+            ctk.CTkLabel(
+                box,
+                text=f"Provider: {provider_name}",
+                font=("", 13, "bold"),
+                text_color="gray",
+            ).pack(anchor="w", padx=10, pady=(8, 2))
+
+            base_row = row(box, "BASE_URL（例：https://api.openai.com/v1）")
+            base = ctk.CTkEntry(base_row)
+            base.insert(0, p.get("BASE_URL", ""))
+            base.pack(fill="x", expand=True)
+
+            model_row = row(box, "MODEL（支持自定义模型 ID）")
+            model = ctk.CTkEntry(model_row)
+            model.insert(0, p.get("MODEL", ""))
+            model.pack(fill="x", expand=True)
+
+            key_row = row(box, "API_KEY")
+            key_frame = ctk.CTkFrame(key_row, fg_color="transparent")
+            key_frame.pack(fill="x", expand=True)
+            key_entry = ctk.CTkEntry(key_frame)
+            key_entry.insert(0, p.get("API_KEY", ""))
+            key_entry.pack(side="left", fill="x", expand=True)
+            if p.get("API_KEY"):
+                hidden_api_keys[provider_name] = p.get("API_KEY", "")
+                try:
+                    key_entry.destroy()
+                except Exception:
+                    pass
+                mask = make_mask_widget(provider_name, key_frame)
+                mask.pack(side="left")
+
+            provider_widgets[provider_name] = {
+                "base": base,
+                "model": model,
+                "key": key_entry,
+            }
+
+    def _add_provider():
+        raw_name = add_name_entry.get().strip()
+        name = _normalize_provider_name(raw_name)
+        if not name:
+            messagebox.showerror("新增失败", "Provider 名称不能为空")
+            return
+        if not _is_valid_provider_name(name):
+            messagebox.showerror("新增失败", "Provider 名称只允许字母/数字/下划线/中划线/点号")
+            return
+        if name in providers_state:
+            messagebox.showinfo("提示", f"Provider '{name}' 已存在")
+            return
+
+        providers_state[name] = {
+            "BASE_URL": add_base_entry.get().strip(),
+            "MODEL": "gpt-4o-mini",
+            "API_KEY": "",
+        }
+        add_name_entry.delete(0, tk.END)
+        add_base_entry.delete(0, tk.END)
+        _render_provider_blocks()
+        _refresh_task_provider_menus()
+        names = _provider_choices()
+        delete_provider_menu.configure(values=names)
+        delete_provider_var.set(name)
+
+    delete_provider_var = tk.StringVar(value=_provider_choices()[0])
+    delete_provider_menu = ctk.CTkOptionMenu(provider_manage, values=_provider_choices(), variable=delete_provider_var)
+    delete_provider_menu.pack(side="left", padx=(10, 6))
+
+    def _delete_provider():
+        name = delete_provider_var.get().strip()
+        if not name:
+            return
+        if name not in providers_state:
+            return
+
+        remaining = [p for p in _provider_choices() if p != name]
+        if not remaining:
+            messagebox.showerror("删除失败", "至少要保留 1 个 provider")
+            return
+        fallback = "deepseek" if "deepseek" in remaining else remaining[0]
+
+        if not messagebox.askyesno("确认删除", f"确定删除 provider '{name}' 吗？"):
+            return
+
+        # 若任务正在引用被删 provider，自动切到兜底 provider。
+        if typo_provider.get() == name:
+            typo_provider.set(fallback)
+        if edit_provider.get() == name:
+            edit_provider.set(fallback)
+
+        providers_state.pop(name, None)
+        hidden_api_keys.pop(name, None)
+        _render_provider_blocks()
+        names = _provider_choices()
+        delete_provider_var.set(fallback if fallback in names else names[0])
+        delete_provider_menu.configure(values=names)
+        _refresh_task_provider_menus()
+
+    ctk.CTkButton(provider_manage, text="+ 新增", width=72, command=_add_provider).pack(side="left", padx=(0, 6))
+    ctk.CTkButton(provider_manage, text="- 删除", width=72, command=_delete_provider).pack(side="left")
 
     def task_block(task_name: str, title: str):
         t = tasks.get(task_name, {}) or {}
@@ -224,9 +334,13 @@ def open_config_editor_form(
         enabled_var = tk.BooleanVar(value=bool(t.get("ENABLED", False)))
         ctk.CTkCheckBox(box, text="启用", variable=enabled_var).pack(anchor="w", padx=10, pady=(4, 6))
 
-        prov = tk.StringVar(value=(t.get("PROVIDER") or "deepseek"))
+        default_provider = (t.get("PROVIDER") or "deepseek").strip()
+        if default_provider not in providers_state:
+            providers_state.setdefault(default_provider, {"BASE_URL": "", "MODEL": "gpt-4o-mini", "API_KEY": ""})
+
+        prov = tk.StringVar(value=default_provider)
         prov_row = row(box, "使用 provider")
-        prov_menu = ctk.CTkOptionMenu(prov_row, values=provider_choices, variable=prov)
+        prov_menu = ctk.CTkOptionMenu(prov_row, values=_provider_choices(), variable=prov)
         prov_menu.pack(side="left")
 
         pfr = row(box, "PROMPT（支持 {text}）")
@@ -234,10 +348,11 @@ def open_config_editor_form(
         prompt.insert("1.0", t.get("PROMPT", "{text}"))
         prompt.pack(side="left", fill="x", expand=True)
 
-        return enabled_var, prov, prompt
+        return enabled_var, prov, prompt, prov_menu
 
-    typo_enabled, typo_provider, typo_prompt = task_block("typo_fix", "任务：错别字修正（typo_fix）")
-    edit_enabled, edit_provider, edit_prompt = task_block("editor", "任务：第二步改写（editor）")
+    typo_enabled, typo_provider, typo_prompt, typo_provider_menu = task_block("typo_fix", "任务：错别字修正（typo_fix）")
+    edit_enabled, edit_provider, edit_prompt, edit_provider_menu = task_block("editor", "任务：第二步改写（editor）")
+    _render_provider_blocks()
 
     # ---- Advanced JSON (optional) ----
     adv = ctk.CTkFrame(body)
@@ -292,21 +407,28 @@ def open_config_editor_form(
         new_cfg["APP"]["DEBUG"] = bool(debug_var.get())
 
         new_cfg.setdefault("LLM", {})
-        new_cfg["LLM"].setdefault("PROVIDERS", {})
+        # 关键：先清空后按当前界面重建，确保被删除的 provider 不会残留
+        new_cfg["LLM"]["PROVIDERS"] = {}
         new_cfg["LLM"].setdefault("TASKS", {})
 
         def set_provider(name: str, base_entry, model_entry, key_alias: str, key_entry):
             new_cfg["LLM"]["PROVIDERS"].setdefault(name, {})
             new_cfg["LLM"]["PROVIDERS"][name]["BASE_URL"] = base_entry.get().strip()
+            # 支持用户自定义任意模型 ID（例如 deepseek-chat / gpt-4o-mini / 自建网关模型名）
             new_cfg["LLM"]["PROVIDERS"][name]["MODEL"] = model_entry.get().strip()
             # key stored masked
             new_cfg["LLM"]["PROVIDERS"][name]["API_KEY"] = (
                 hidden_api_keys.get(key_alias) or key_entry.get() or ""
             ).strip()
 
-        set_provider("deepseek", deepseek_base, deepseek_model, "deepseek", deepseek_key_entry)
-        set_provider("openai", openai_base, openai_model, "openai", openai_key_entry)
-        set_provider("custom", custom_base, custom_model, "custom", custom_key_entry)
+        for p_name, widgets in provider_widgets.items():
+            set_provider(
+                p_name,
+                widgets["base"],
+                widgets["model"],
+                p_name,
+                widgets["key"],
+            )
 
         def set_task(name: str, enabled_var, provider_var, prompt_widget):
             new_cfg["LLM"]["TASKS"].setdefault(name, {})
@@ -317,10 +439,7 @@ def open_config_editor_form(
         set_task("typo_fix", typo_enabled, typo_provider, typo_prompt)
         set_task("editor", edit_enabled, edit_provider, edit_prompt)
 
-        # simple validation
-        if not new_cfg["OCR"]["XFYUN"]["URL"] or not new_cfg["OCR"]["XFYUN"]["APPID"] or not new_cfg["OCR"]["XFYUN"]["API_KEY"]:
-            messagebox.showerror("保存失败", "OCR 配置不完整（URL/APPID/API_KEY 必填）")
-            return
+        # 允许空配置保存：这里不做必填拦截，仅保持结构化写入。
 
         try:
             _write_cfg(cfg_path, new_cfg)
