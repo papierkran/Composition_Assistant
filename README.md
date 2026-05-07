@@ -1,4 +1,4 @@
-# Composition OCR Assistant 作文修改助手
+# Composition Assistant 作文修改助手
 
 一个面向作文图片批量处理的 PySide6 图形化工具。它可以扫描作文文件夹中的图片，调用讯飞手写 OCR 识别文字，生成 Word 文档，并按需接入 OpenAI-compatible API 做错别字修正和作文改写。
 
