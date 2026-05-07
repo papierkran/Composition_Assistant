@@ -187,6 +187,9 @@ def llm_fix_typos(prompt_template: str, text: str, client: OpenAI, model: str) -
         print(prompt)
         print("\n======================================================\n")
 
+    # 后台日志：打印发给 LLM 的内容到控制台
+    print(f"\n[LLM Prompt - Typo Fix] Sending to typo fix LLM:\n{prompt}\n", flush=True)
+
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -213,6 +216,106 @@ def llm_fix_typos(prompt_template: str, text: str, client: OpenAI, model: str) -
         print("\n=====================================================\n")
 
     return result_text
+
+
+def count_chinese_characters(text: str) -> int:
+    """Count non-whitespace characters for word-count rules, including punctuation."""
+    return sum(1 for ch in text if not ch.isspace())
+
+
+def determine_word_count_bounds(original_count: int) -> tuple[int, int]:
+    """Return (min_count, max_count) based on the original article length."""
+    if original_count >= 850:
+        return max(700, original_count - 30), original_count + 30
+    if original_count >= 800:
+        return 820, 850
+    return 700, 820
+
+
+def is_word_count_within_rules(text: str, original_count: int) -> bool:
+    """Check whether the LLM output satisfies the composition word-count rule."""
+    count = count_chinese_characters(text)
+    min_count, max_count = determine_word_count_bounds(original_count)
+    return min_count <= count <= max_count
+
+
+def llm_edit_with_word_count_supervision(prompt_template: str, full_text: str, client: OpenAI, model: str, original_count: int, count_min=None, count_max=None, log_callback=None) -> str:
+    """Send editor prompt to LLM and retry until word count rules are satisfied."""
+    if not prompt_template:
+        prompt_template = DEFAULT_TYPO_FIX_PROMPT
+
+    if count_min is None or count_max is None:
+        default_min, default_max = determine_word_count_bounds(original_count)
+        count_min = default_min if count_min is None else count_min
+        count_max = default_max if count_max is None else count_max
+
+    if "{text}" in prompt_template:
+        prompt = prompt_template.format(text=full_text)
+    else:
+        prompt = prompt_template + "\n\n" + full_text
+
+    prompt += f"\n\n请注意：这一次的修改后的正文总字数应控制在 {count_min} 到 {count_max} 之间"
+
+    attempts = 0
+    max_attempts = 4
+    last_response = None
+
+    while attempts < max_attempts:
+        attempts += 1
+        current_prompt = prompt
+        if attempts > 1:
+            current_prompt += (
+                "\n\n字数不符合规则，请重新修改并返回修改后的正文。"
+                " 只输出正文，不做解释。"
+                f" 这次要求字数在 {count_min} 到 {count_max} 之间。"
+            )
+
+        if DEBUG:
+            print("\n=================【发送给 editor LLM 的内容】=================\n")
+            print(current_prompt)
+            print("\n=============================================================")
+
+        # 后台日志：打印发给 LLM 的内容到控制台
+        print(f"\n[LLM Prompt - Attempt {attempts}] Sending to editor LLM:\n{current_prompt}\n", flush=True)
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "你是一名严谨的中文写作编辑助手"},
+                {"role": "user", "content": current_prompt},
+            ],
+            temperature=0.1,
+            stream=False,
+        )
+
+        last_response = response
+        result_text = response.choices[0].message.content.strip()
+
+        if DEBUG:
+            print("\n=================【editor LLM 修改后的正文】=================\n")
+            print(result_text)
+            print("\n============================================================\n")
+
+        current_count = count_chinese_characters(result_text)
+        if count_min <= current_count <= count_max:
+            return result_text
+
+        if log_callback:
+            log_callback(
+                f"  ⚠️ 第{attempts}次 editor LLM 返回字数不合规：{current_count}，目标 {count_min}-{count_max}，正在重试..."
+            )
+        else:
+            _LOGGER.warning(
+                "第 %s 次 editor LLM 返回的字数不符合规则：%s，目标范围 %s-%s，正在重试...",
+                attempts,
+                current_count,
+                count_min,
+                count_max,
+            )
+
+    raise RuntimeError(
+        f"LLM 未能返回符合字数规则的结果；最后一次字数 {count_chinese_characters(last_response.choices[0].message.content.strip())} 不在 ({count_min}, {count_max})"
+    )
 
 
 # ocr 并处理自然段
@@ -316,10 +419,14 @@ def create_word(doc_path: str, all_text_blocks, folder_display_name: str):
 
 
 def has_images(folder_path: str) -> bool:
-    return any(
-        f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
-        for f in os.listdir(folder_path)
-    )
+    try:
+        return any(
+            f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
+            for f in os.listdir(folder_path)
+            if os.path.isfile(os.path.join(folder_path, f))
+        )
+    except Exception:
+        return False
 
 
 
@@ -327,13 +434,50 @@ def has_images(folder_path: str) -> bool:
 def process_folder(folder_path: str,
                    log_callback=print,
                    use_typo_fix: bool = False,
-                   use_editor: bool = False):
+                   use_editor: bool = False,
+                   task_status_callback=None):
+    if task_status_callback:
+        task_status_callback(folder_path, "running")
+
     folder_name = os.path.basename(folder_path)
     all_paragraphs = []
 
-    for filename in os.listdir(folder_path):
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+    # 读取百度图片矫正配置
+    baidu_cfg = (config.get("OCR", {}) or {}).get("BAIDU_CORRECTION", {})
+    use_baidu_correction = bool(baidu_cfg.get("ENABLED", False))
+    baidu_api_key = (baidu_cfg.get("API_KEY") or "").strip()
+    baidu_secret_key = (baidu_cfg.get("SECRET_KEY") or "").strip()
+
+    try:
+        for filename in os.listdir(folder_path):
+            if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                continue
+            if os.path.isdir(os.path.join(folder_path, filename)):
+                continue
             img_path = os.path.join(folder_path, filename)
+
+            # 图片矫正：备份原图到 "旧" 文件夹，调用百度 API 矫正后替换
+            if use_baidu_correction and baidu_api_key and baidu_secret_key:
+                try:
+                    backup_dir = os.path.join(folder_path, "旧")
+                    os.makedirs(backup_dir, exist_ok=True)
+                    backup_path = os.path.join(backup_dir, filename)
+
+                    import shutil
+                    if not os.path.exists(backup_path):
+                        shutil.copy2(img_path, backup_path)
+                        log_callback(f"📷 已备份原图：{filename} → 旧/")
+
+                    from baidu_image_corrector import BaiduImageCorrector
+                    corrector = BaiduImageCorrector(baidu_api_key, baidu_secret_key)
+                    corrected_data = corrector.correct_image(img_path, enhance_type=1)
+
+                    with open(img_path, "wb") as f:
+                        f.write(corrected_data)
+                    log_callback(f"📷 已矫正图片：{filename}")
+                except Exception as e:
+                    log_callback(f"⚠️ 图片矫正失败：{filename}，原因：{e}，将使用原图继续")
+
             try:
                 log_callback(f"正在识别：{img_path}")
                 paragraphs = ocr_and_extract_text(img_path)
@@ -341,9 +485,41 @@ def process_folder(folder_path: str,
             except Exception as e:
                 log_callback(f"识别失败：{img_path}，原因：{e}")
 
-    if all_paragraphs:
-        doc_path = os.path.join(folder_path, f"{folder_name}.docx")
-        log_callback(f"正在生成 Word：{doc_path}")
+        if all_paragraphs:
+            doc_path = os.path.join(folder_path, f"{folder_name}.docx")
+            log_callback(f"正在生成 Word：{doc_path}")
+
+            # ① 先生成 Word（修改前 / 修改后 框架）
+            create_word(doc_path, all_paragraphs, folder_name)
+
+            # ② 再根据开关决定是否调用 LLM 纠错
+            if use_typo_fix:
+                log_callback("🤖 正在调用 LLM 进行错别字纠正...")
+                try:
+                    fix_docx_with_llm(doc_path, task_name="typo_fix")
+                    log_callback("✅ LLM 纠错完成")
+                except Exception as e:
+                    log_callback(f"⚠️ LLM 纠错失败：{e}")
+
+            # ③ 如果启用了第二步编辑，再把纠正后的正文送到 editor 任务处理
+            if use_editor:
+                log_callback("🤖 正在调用 LLM 进行第二步作文改写...")
+                try:
+                    edit_docx_with_llm(doc_path, task_name="editor", log_callback=log_callback)
+                    log_callback("✅ 第二步改写完成")
+                except Exception as e:
+                    log_callback(f"⚠️ 第二步改写失败：{e}")
+
+            if task_status_callback:
+                task_status_callback(folder_path, "done")
+        else:
+            log_callback(f"{folder_path} 中没有可识别的图片")
+            if task_status_callback:
+                task_status_callback(folder_path, "failed")
+    except Exception as e:
+        log_callback(f"处理失败：{folder_path}，原因：{e}")
+        if task_status_callback:
+            task_status_callback(folder_path, "failed")
 
         # ① 先生成 Word（修改前 / 修改后 框架）
         create_word(doc_path, all_paragraphs, folder_name)
@@ -361,7 +537,7 @@ def process_folder(folder_path: str,
         if use_editor:
             log_callback("🤖 正在调用 LLM 进行第二步作文改写...")
             try:
-                edit_docx_with_llm(doc_path, task_name="editor")
+                edit_docx_with_llm(doc_path, task_name="editor", log_callback=log_callback)
                 log_callback("✅ 第二步改写完成")
             except Exception as e:
                 log_callback(f"⚠️ 第二步改写失败：{e}")
@@ -573,11 +749,11 @@ def fix_docx_with_llm(docx_path: str, task_name: str = "typo_fix"):
     doc.save(docx_path)
 
 
-def edit_docx_with_llm(docx_path: str, task_name: str = "editor"):
+def edit_docx_with_llm(docx_path: str, task_name: str = "editor", log_callback=print):
     """使用 OpenAI-compatible LLM 对纠错后的文章进行进一步修改，并插入到“修改后：”之后。"""
     task_cfg = (config.get("LLM", {}) or {}).get("TASKS", {}).get(task_name, {})
     if not bool(task_cfg.get("ENABLED", False)):
-        _LOGGER.info("第二步编辑未启用，跳过")
+        log_callback("第二步编辑未启用，跳过")
         return
 
     clients, model, prompt_template = resolve_task_clients(config, task_name)
@@ -586,7 +762,7 @@ def edit_docx_with_llm(docx_path: str, task_name: str = "editor"):
 
     corrected_paragraphs = extract_before_text(doc)
     if not corrected_paragraphs:
-        _LOGGER.info("未找到可供第二步处理的正文，跳过")
+        log_callback("未找到可供第二步处理的正文，跳过")
         return
 
     full_text = "\n".join(corrected_paragraphs)
@@ -594,48 +770,45 @@ def edit_docx_with_llm(docx_path: str, task_name: str = "editor"):
     if not prompt_template:
         prompt_template = DEFAULT_TYPO_FIX_PROMPT
 
-    if "{text}" in prompt_template:
-        prompt = prompt_template.format(text=full_text)
-    else:
-        prompt = prompt_template + "\n\n" + full_text
-
-    if DEBUG:
-        print("\n=================【发送给 editor LLM 的内容】=================\n")
-        print(prompt)
-        print("\n=============================================================\n")
+    count_min = task_cfg.get("COUNT_MIN")
+    count_max = task_cfg.get("COUNT_MAX")
+    try:
+        count_min = int(count_min) if count_min is not None else None
+    except (TypeError, ValueError):
+        count_min = None
+    try:
+        count_max = int(count_max) if count_max is not None else None
+    except (TypeError, ValueError):
+        count_max = None
 
     last_err = None
     result_text = None
+    original_count = count_chinese_characters(full_text)
+    log_callback(f"  第二步编辑开始，原字数：{original_count}")
     for base_url, client in clients:
         try:
-            _LOGGER.info(f"尝试 editor LLM 节点：{base_url}")
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "你是一名严谨的中文写作编辑助手"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-                stream=False,
+            log_callback(f"  尝试 editor LLM 节点：{base_url}")
+            result_text = llm_edit_with_word_count_supervision(
+                prompt_template,
+                full_text,
+                client,
+                model,
+                original_count,
+                count_min=count_min,
+                count_max=count_max,
+                log_callback=log_callback,
             )
-
-            if DEBUG:
-                print("\n=================【editor LLM 原始返回 response】=================\n")
-                try:
-                    print(response)
-                except Exception:
-                    print(repr(response))
-                print("\n===============================================================\n")
-
-            result_text = response.choices[0].message.content.strip()
-            _LOGGER.info(f"editor LLM 节点成功：{base_url}")
+            log_callback(f"  editor LLM 节点成功：{base_url}")
             break
         except Exception as e:
             last_err = e
-            _LOGGER.warning(f"editor LLM 节点失败：{base_url} -> {e}")
+            log_callback(f"  editor LLM 节点失败：{base_url} -> {e}")
 
     if result_text is None:
         raise last_err or RuntimeError("所有 editor LLM 节点均不可用")
+
+    new_count = count_chinese_characters(result_text)
+    log_callback(f"  第二步编辑完成，新字数：{new_count}")
 
     if DEBUG:
         print("\n=================【editor LLM 修改后的正文】=================\n")
@@ -652,14 +825,30 @@ def edit_docx_with_llm(docx_path: str, task_name: str = "editor"):
 
 
 # 遍历文件夹识别图片
-def process_all(root_dir, log_callback=print, use_typo_fix=False, use_editor=False):
+def process_all(root_dir, log_callback=print, use_typo_fix=False, use_editor=False, cfg: dict = None, task_status_callback=None):
+    """处理所有图片并生成 Word 文档。
+    
+    Args:
+        root_dir: 根目录路径
+        log_callback: 日志回调函数
+        use_typo_fix: 是否启用 AI 错别字修正
+        use_editor: 是否启用第二步编辑
+        cfg: 配置字典（可选，若提供则更新全局配置）
+        task_status_callback: 可选的任务状态回调函数，接收(folder_path, status)
+    """
+    # 如果提供了配置参数，更新全局配置
+    if cfg is not None:
+        _update_globals_from_config(cfg)
+    
     if has_images(root_dir):
-        process_folder(root_dir, log_callback, use_typo_fix=use_typo_fix, use_editor=use_editor)
+        process_folder(root_dir, log_callback, use_typo_fix=use_typo_fix, use_editor=use_editor, task_status_callback=task_status_callback)
     else:
         for sub in os.listdir(root_dir):
+            if sub == "旧":
+                continue
             sub_path = os.path.join(root_dir, sub)
             if os.path.isdir(sub_path) and has_images(sub_path):
-                process_folder(sub_path, log_callback, use_typo_fix=use_typo_fix, use_editor=use_editor)
+                process_folder(sub_path, log_callback, use_typo_fix=use_typo_fix, use_editor=use_editor, task_status_callback=task_status_callback)
 
 
 if __name__ == '__main__':

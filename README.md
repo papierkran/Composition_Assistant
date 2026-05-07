@@ -100,3 +100,61 @@ OCR 接口地址（默认可用）
 
 ## 📃 License
 本项目仅供学习和教育用途，禁止商业或非法用途。API 使用请遵守讯飞开发者服务协议。
+
+---
+
+## 🔄 PySide6 重构版 (V2.0)
+
+本项目已从 CustomTkinter 迁移到 PySide6 (Qt)，提供更好的性能和高DPI支持。
+
+### 主要改进
+- **性能提升**：原生 Qt 渲染，窗口缩放流畅，4K屏不再卡顿
+- **高DPI支持**：自动适配高分辨率显示器
+- **更稳定的布局**：使用 Qt 的 QVBoxLayout/QHBoxLayout，布局更可靠
+- **更好的滚动性能**：QScrollArea 替代自定义滚动框架
+
+### 文件结构
+```
+Composition_OCR_Assistant/
+├── ocr_gui.py              # PySide6 主程序
+├── config_editor_ui.py     # PySide6 配置编辑器
+├── ocr_main.py             # 核心处理逻辑
+├── config_migrate.py       # 配置迁移工具
+├── llm_client.py           # LLM 客户端
+├── config.json             # 配置文件
+├── app.ico                 # 应用图标
+├── ocr_gui.spec            # PyInstaller 打包配置
+├── dist/
+│   └── ocr_gui.exe         # 打包好的可执行文件
+└── 旧版CTK/                # 旧版 CustomTkinter 代码备份
+    ├── ocr_gui_ctk.py
+    ├── config_editor_ui_ctk.py
+    └── ...
+```
+
+### 运行方式
+```bash
+python ocr_gui.py
+```
+
+### 打包为 exe
+```bash
+pyinstaller --clean ocr_gui.spec
+```
+生成的 exe 位于 `dist/ocr_gui.exe`
+
+### 依赖
+```
+PySide6>=6.5.0
+python-docx
+openai
+Pillow
+```
+
+### 功能特性
+- **双页面切换**：图片转作文 / docx作文处理
+- **可折叠配置区**：百度图片矫正、OCR配置可收起展开
+- **任务队列管理**：支持批量添加、删除、刷新任务
+- **AI 错别字修正**：集成 DeepSeek/OpenAI 等 LLM API
+- **AI 作文修改**：支持字数控制和自定义提示词
+- **多 Provider 支持**：可添加自定义 AI 服务提供商

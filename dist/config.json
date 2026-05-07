@@ -1,0 +1,42 @@
+{
+  "OCR": {
+    "PROVIDER": "xfyun_handwriting",
+    "XFYUN": {
+      "URL": "http://webapi.xfyun.cn/v1/service/v1/ocr/handwriting",
+      "APPID": "",
+      "API_KEY": "",
+      "LANGUAGE": "cn|en",
+      "LOCATION": "false"
+    }
+  },
+  "LLM": {
+    "PROVIDERS": {
+      "deepseek": {
+        "BASE_URL": "https://api.deepseek.com/v1",
+        "MODEL": "deepseek-chat",
+        "API_KEY": ""
+      },
+      "openai": {
+        "BASE_URL": "https://api.openai.com/v1",
+        "MODEL": "gpt-4o-mini",
+        "API_KEY": ""
+      }
+    },
+    "TASKS": {
+      "typo_fix": {
+        "ENABLED": false,
+        "PROVIDER": "deepseek",
+        "PROMPT": "{text}"
+      },
+      "editor": {
+        "ENABLED": false,
+        "PROVIDER": "deepseek",
+        "PROMPT": "{text}"
+      }
+    }
+  },
+  "APP": {
+    "ROOT_DIR": "",
+    "DEBUG": false
+  }
+}
