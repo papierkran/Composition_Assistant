@@ -25,7 +25,7 @@
     "TASKS": {
       "typo_fix": {
         "ENABLED": false,
-        "PROVIDER": "deepseek",
+        "PROVIDER": "openai",
         "PROMPT": "{text}"
       },
       "editor": {

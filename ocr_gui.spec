@@ -1,15 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+
 a = Analysis(
     ['ocr_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('app.ico', '.'), ('config.json', '.'), ('ocr', 'ocr')],
-    hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets'],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'customtkinter'],
+    excludes=[],
     noarchive=False,
     optimize=0,
 )
@@ -34,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='app.ico',
+    icon=['app.ico'],
 )

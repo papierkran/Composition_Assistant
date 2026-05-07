@@ -1,6 +1,7 @@
 # coding=utf-8
 # ocr_main.py
 import os
+import sys
 import time
 import hashlib
 import base64
@@ -21,23 +22,25 @@ import json
 from config_migrate import ensure_new_schema
 from llm_client import resolve_task_client, resolve_task_clients
 
-# 默认使用项目目录下的 config.json；如需覆盖，可通过环境变量 OCR_CONFIG_FILE 指定。
-CONFIG_FILE = Path(os.environ.get("OCR_CONFIG_FILE", "config.json")).expanduser()
+# 配置文件加载：优先个人目录 → 当前目录
+def _exe_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+PERSONAL_CONFIG = Path(r"D:\person_data\ocer助手\presson.json")
+LOCAL_CONFIG = _exe_dir() / "config.json"
 
 def load_config(path: Path = None):
-    """Load configuration from JSON file.
-
-    Tries environment-configured path first, then falls back to './config.json'.
-    Returns DEFAULT-like dict when file missing will raise a RuntimeError to force user action.
-    """
-    cfg_path = Path(path or CONFIG_FILE)
-    if not cfg_path.exists():
-        # try local config.json as a fallback
-        local = Path("config.json")
-        if local.exists():
-            cfg_path = local
-        else:
-            raise RuntimeError("❌ 未找到 config.json 或相关配置文件，请先配置")
+    """加载配置：优先个人目录 → 当前目录 → 报错"""
+    if path:
+        cfg_path = Path(path)
+    elif PERSONAL_CONFIG.exists():
+        cfg_path = PERSONAL_CONFIG
+    elif LOCAL_CONFIG.exists() and LOCAL_CONFIG.stat().st_size > 0:
+        cfg_path = LOCAL_CONFIG
+    else:
+        raise RuntimeError("❌ 未找到有效配置文件，请先配置")
 
     with cfg_path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -437,7 +440,7 @@ def process_folder(folder_path: str,
                    use_editor: bool = False,
                    task_status_callback=None):
     if task_status_callback:
-        task_status_callback(folder_path, "running")
+        task_status_callback(folder_path, "running", step="OCR识别", log_msg="开始处理...")
 
     folder_name = os.path.basename(folder_path)
     all_paragraphs = []
@@ -480,6 +483,8 @@ def process_folder(folder_path: str,
 
             try:
                 log_callback(f"正在识别：{img_path}")
+                if task_status_callback:
+                    task_status_callback(folder_path, "running", step="OCR识别", log_msg=f"识别: {filename}")
                 paragraphs = ocr_and_extract_text(img_path)
                 all_paragraphs.extend(paragraphs)
             except Exception as e:
@@ -488,6 +493,8 @@ def process_folder(folder_path: str,
         if all_paragraphs:
             doc_path = os.path.join(folder_path, f"{folder_name}.docx")
             log_callback(f"正在生成 Word：{doc_path}")
+            if task_status_callback:
+                task_status_callback(folder_path, "running", step="生成Word", log_msg="生成文档中...")
 
             # ① 先生成 Word（修改前 / 修改后 框架）
             create_word(doc_path, all_paragraphs, folder_name)
@@ -495,31 +502,39 @@ def process_folder(folder_path: str,
             # ② 再根据开关决定是否调用 LLM 纠错
             if use_typo_fix:
                 log_callback("🤖 正在调用 LLM 进行错别字纠正...")
+                if task_status_callback:
+                    task_status_callback(folder_path, "running", step="AI错别字修正", log_msg="正在调用AI修正...")
                 try:
                     fix_docx_with_llm(doc_path, task_name="typo_fix")
                     log_callback("✅ LLM 纠错完成")
+                    if task_status_callback:
+                        task_status_callback(folder_path, "running", step="AI错别字修正", log_msg="AI修正完成")
                 except Exception as e:
                     log_callback(f"⚠️ LLM 纠错失败：{e}")
 
             # ③ 如果启用了第二步编辑，再把纠正后的正文送到 editor 任务处理
             if use_editor:
                 log_callback("🤖 正在调用 LLM 进行第二步作文改写...")
+                if task_status_callback:
+                    task_status_callback(folder_path, "running", step="AI作文改写", log_msg="正在改写作文...")
                 try:
                     edit_docx_with_llm(doc_path, task_name="editor", log_callback=log_callback)
                     log_callback("✅ 第二步改写完成")
+                    if task_status_callback:
+                        task_status_callback(folder_path, "running", step="AI作文改写", log_msg="作文改写完成")
                 except Exception as e:
                     log_callback(f"⚠️ 第二步改写失败：{e}")
 
             if task_status_callback:
-                task_status_callback(folder_path, "done")
+                task_status_callback(folder_path, "done", step="完成", log_msg="处理完成")
         else:
             log_callback(f"{folder_path} 中没有可识别的图片")
             if task_status_callback:
-                task_status_callback(folder_path, "failed")
+                task_status_callback(folder_path, "failed", log_msg="无图片")
     except Exception as e:
         log_callback(f"处理失败：{folder_path}，原因：{e}")
         if task_status_callback:
-            task_status_callback(folder_path, "failed")
+            task_status_callback(folder_path, "failed", log_msg=f"失败: {e}")
 
         # ① 先生成 Word（修改前 / 修改后 框架）
         create_word(doc_path, all_paragraphs, folder_name)

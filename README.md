@@ -1,160 +1,192 @@
-# OCR 图像文字识别工具
+# Composition OCR Assistant 作文修改助手
 
-本项目是一个基于 Python 的图形化工具，支持使用 [讯飞开放平台](https://www.xfyun.cn/services/ocr_general) 的 **手写文字识别 API** 对指定文件夹下的图片进行批量 OCR 识别，并自动生成 Word 文档。
+一个面向作文图片批量处理的 PySide6 图形化工具。它可以扫描作文文件夹中的图片，调用讯飞手写 OCR 识别文字，生成 Word 文档，并按需接入 OpenAI-compatible API 做错别字修正和作文改写。
 
-支持自定义 API 参数配置，自动保存配置，下次启动自动填充。图形化界面友好，操作简便，适合教师、教辅、资料归档等使用场景。
-
-支持 deepseek api 的错别字改正
-
-即将更新多工具选择进行ocr（画饼）
+适合教师、教辅、资料整理等批量处理场景。
 
 ---
 
-## 📦 功能说明
+## 主要功能
 
-- 支持识别 `.jpg`, `.png`, `.bmp`, `.jpeg` 格式图片
-- 自动识别当前文件夹或其子文件夹中的图片内容
-- 图片识别内容自动写入 Word（`.docx`），字体：宋体，小四，段前段后为 0，最小行距 12 磅
-- 每张图片自动标注“修改前”、“修改后”结构，并分页
-- 图片所在文件夹名写入 Word 中作为“——姓名”标注
-- 支持 GUI 操作，支持打包为 `.exe` 使用，无需 Python 环境
-- (V0.3更新) 简易自然段逻辑分割
-- (V0.5更新) 支持deepseek api 的错别字改正 (注意config.json的配置文件进行配置)
-
----
-
-## 🖼️ 图形界面功能
-
-- 输入讯飞 `APPID`, `API_KEY`, `OCR接口URL`
-- 选择或手动输入图片所在目录路径
-- 点击“开始识别”按钮自动批量处理并生成 Word 文件
-- 所有配置自动保存，下次启动自动加载
+- 图片批量 OCR：支持 `.jpg`、`.jpeg`、`.png`、`.bmp`
+- 自动扫描任务：可识别当前作文文件夹，或其一级子文件夹中的图片任务
+- Word 输出：按作文文件夹名生成同名 `.docx`
+- AI 错别字修正：支持 DeepSeek、OpenAI 或自定义 OpenAI-compatible Provider
+- AI 作文改写：支持自定义 Prompt，并可设置目标字数范围
+- 百度图片矫正：可在 OCR 前自动矫正倾斜/弯曲文档图片
+- 任务队列：显示学生姓名、文件路径、作文名称、修改前字数、当前步骤、修改后字数、状态、实时日志
+- 多线程处理：默认同时处理 3 个任务，队列日志按任务行独立更新
+- 失败重试：只有“已完成”的任务会跳过，“失败”的任务再次开始时会重新处理
+- 手动重新加入：选中任务后点击“重新加入”，可把任务改回等待处理
+- 配置编辑器：可在 GUI 中管理 OCR、AI Provider、Prompt 等配置
 
 ---
 
-## 🚀 快速开始
+## 界面说明
 
-### 1. 安装依赖
+### 图片转作文
+
+这是主处理页，用于从作文图片生成 Word，并可继续执行 AI 修正/改写。
+
+常用流程：
+
+1. 填写或选择“作文文件夹”路径。
+2. 按需展开“百度图片矫正”“OCR 识别配置”“AI 错别字修正”“AI 修改作文”。
+3. 点击“开始处理（自动读取路径下任务并开始）”。
+4. 查看任务队列中的“当前步骤”“状态”和“实时日志”。
+
+任务队列按钮：
+
+- `添加`：手动选择一个含图片的任务文件夹加入队列。
+- `删除`：删除选中的队列项，并清除其完成/失败标记。
+- `重新加入`：把选中的任务重新改为待处理；正在处理中的任务会跳过。
+- `读取`：扫描当前作文文件夹，把新任务加入队列。
+- `刷新队列`：清理无效路径并重绘队列。
+
+开始处理规则：
+
+- 点击开始时会重新扫描当前作文文件夹。
+- 已在队列中的任务不会重复添加。
+- 后续新增任务会追加到队列。
+- 如果已有任务正在处理，不会启动第二个调度器；新任务会排队等待线程池处理。
+- 状态为“已完成”的任务会跳过。
+- 状态为“失败”或“待完成”的任务会重新进入处理队列。
+
+### docx作文处理
+
+用于对已有 Word/图片文件执行文档后处理流程。
+
+可选步骤包括：
+
+- DOC 转 DOCX
+- 清除空格
+- AI 改作文
+- 添加标签
+- 格式化
+- 修改作者
+
+处理日志可折叠展开，适合单独对已有文档做二次整理。
+
+---
+
+## 输出格式
+
+图片转作文会在任务文件夹中生成同名 Word 文件：
+
+```text
+任务文件夹/
+├── 1.jpg
+├── 2.jpg
+└── 任务文件夹名.docx
+```
+
+Word 内容结构：
+
+- 文件夹名会作为姓名/标题标注写入文档。
+- OCR 内容写入“修改前：”区域。
+- 文档预留“修改后：”区域。
+- 启用 AI 错别字修正后，会把修正内容插入到对应区域。
+- 启用 AI 作文改写后，会把改写结果写入“修改后：”区域。
+
+---
+
+## 配置说明
+
+配置加载优先级：
+
+1. `D:\person_data\ocer助手\presson.json`
+2. 程序所在目录的 `config.json`
+3. 默认配置
+
+GUI 保存配置时会优先保存到个人配置目录；如果个人配置目录不存在，则保存到程序所在目录的 `config.json`。
+
+主要配置项：
+
+- `OCR.XFYUN.URL`：讯飞 OCR 接口地址
+- `OCR.XFYUN.APPID`：讯飞 APPID
+- `OCR.XFYUN.API_KEY`：讯飞 API Key
+- `OCR.BAIDU_CORRECTION`：百度图片矫正配置
+- `LLM.PROVIDERS`：AI Provider 列表
+- `LLM.TASKS.typo_fix`：错别字修正任务配置
+- `LLM.TASKS.editor`：作文改写任务配置
+- `APP.ROOT_DIR`：默认作文文件夹路径
+
+---
+
+## 运行方式
+
+安装依赖：
 
 ```bash
-pip install -r requirements.txt
-```
-或手动安装：
-```
-pip install PyQt5 python-docx requests
+pip install PySide6 python-docx requests openai Pillow
 ```
 
-### 2. 运行程序
-```
-python ocr_gui.py
-```
+运行 GUI：
 
-## 📝 配置说明
-程序会自动在当前目录生成一个配置文件：
-```json
-config.json
-```
-
-## 📄 输出格式说明
-
-每张图片对应一个“修改前：”和“修改后：”段落结构
-
-段落之间添加分页符
-
-在“修改前：”上方插入 ——姓名（文件夹名） 居中段落
-
-所有图片识别结果拼接在同一个 Word 中，文件名为对应文件夹名称
-
-## 🔐 目前 ocr API 获取方式
-请在讯飞开放平台申请并获取：
-
-APPID
-
-API_KEY
-
-OCR 接口地址（默认可用）
-
-申请地址：https://www.xfyun.cn/services/ocr_general
-
-## 📌 注意事项
-
-仅支持中文/英文手写识别（建议图片清晰，避免旋转）
-
-单张图识别失败不会影响整体执行，会跳过
-
-若图片较大或数量过多，识别需等待数秒
-
-单张图片不能超过5MB
-
-## TODO
-
-段落识别
-
-自动改错别字
-
-接入更多api
-
-本地运行ocr
-
-
-
-## 📃 License
-本项目仅供学习和教育用途，禁止商业或非法用途。API 使用请遵守讯飞开发者服务协议。
-
----
-
-## 🔄 PySide6 重构版 (V2.0)
-
-本项目已从 CustomTkinter 迁移到 PySide6 (Qt)，提供更好的性能和高DPI支持。
-
-### 主要改进
-- **性能提升**：原生 Qt 渲染，窗口缩放流畅，4K屏不再卡顿
-- **高DPI支持**：自动适配高分辨率显示器
-- **更稳定的布局**：使用 Qt 的 QVBoxLayout/QHBoxLayout，布局更可靠
-- **更好的滚动性能**：QScrollArea 替代自定义滚动框架
-
-### 文件结构
-```
-Composition_OCR_Assistant/
-├── ocr_gui.py              # PySide6 主程序
-├── config_editor_ui.py     # PySide6 配置编辑器
-├── ocr_main.py             # 核心处理逻辑
-├── config_migrate.py       # 配置迁移工具
-├── llm_client.py           # LLM 客户端
-├── config.json             # 配置文件
-├── app.ico                 # 应用图标
-├── ocr_gui.spec            # PyInstaller 打包配置
-├── dist/
-│   └── ocr_gui.exe         # 打包好的可执行文件
-└── 旧版CTK/                # 旧版 CustomTkinter 代码备份
-    ├── ocr_gui_ctk.py
-    ├── config_editor_ui_ctk.py
-    └── ...
-```
-
-### 运行方式
 ```bash
 python ocr_gui.py
 ```
 
-### 打包为 exe
+命令行处理入口：
+
+```bash
+python ocr_main.py <作文文件夹路径>
+```
+
+常用参数：
+
+```bash
+python ocr_main.py <作文文件夹路径> --config config.json
+python ocr_main.py <作文文件夹路径> --no-deepseek
+python ocr_main.py <作文文件夹路径> --no-editor
+python ocr_main.py <作文文件夹路径> --debug
+```
+
+---
+
+## 打包为 EXE
+
 ```bash
 pyinstaller --clean ocr_gui.spec
 ```
-生成的 exe 位于 `dist/ocr_gui.exe`
 
-### 依赖
-```
-PySide6>=6.5.0
-python-docx
-openai
-Pillow
+生成文件位于：
+
+```text
+dist/ocr_gui.exe
 ```
 
-### 功能特性
-- **双页面切换**：图片转作文 / docx作文处理
-- **可折叠配置区**：百度图片矫正、OCR配置可收起展开
-- **任务队列管理**：支持批量添加、删除、刷新任务
-- **AI 错别字修正**：集成 DeepSeek/OpenAI 等 LLM API
-- **AI 作文修改**：支持字数控制和自定义提示词
-- **多 Provider 支持**：可添加自定义 AI 服务提供商
+---
+
+## 文件结构
+
+```text
+Composition_OCR_Assistant/
+├── ocr_gui.py              # PySide6 主程序
+├── ocr_main.py             # OCR 与 Word/AI 处理核心逻辑
+├── config_editor_ui.py     # 配置编辑器
+├── config_migrate.py       # 配置迁移工具
+├── llm_client.py           # OpenAI-compatible LLM 客户端
+├── baidu_image_corrector.py
+├── ocr_gui.spec            # PyInstaller 打包配置
+├── config.json             # 本地配置文件
+├── app.ico                 # 应用图标
+├── dist/                   # 打包输出
+└── 旧版CTK/                # 旧版 CustomTkinter 代码备份
+```
+
+---
+
+## 注意事项
+
+- 讯飞手写 OCR 单张图片大小不要超过接口限制，建议图片清晰、方向正确。
+- 启用百度图片矫正会改变处理前的图片流程，建议先用少量样本验证效果。
+- 启用 AI 错别字修正或作文改写会明显增加处理时间，并消耗对应 API 额度。
+- 多线程默认并发数为 3；如果 API 限流频繁，可在 `ocr_gui.py` 中调整 `self.max_parallel_tasks`。
+- 任务队列状态以 GUI 运行期间为准；重启程序后不会恢复上次队列运行状态。
+
+---
+
+## License
+
+本项目仅供学习和教育用途，禁止商业或非法用途。OCR 和 AI API 使用请遵守对应服务商协议。

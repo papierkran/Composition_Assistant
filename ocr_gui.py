@@ -1,6 +1,7 @@
 import base64
 import json
 import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 import sys
 import os
@@ -26,7 +27,14 @@ from openai import OpenAI
 
 
 # ================= 默认配置 =================
-CONFIG_FILE = Path(os.environ.get("OCR_CONFIG_FILE", "config.json")).expanduser()
+# 打包后 _MEIPASS 是临时目录，EXE 所在目录才是用户目录
+def _exe_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+PERSONAL_CONFIG = Path(r"D:\person_data\ocer助手\presson.json")
+LOCAL_CONFIG = _exe_dir() / "config.json"
 
 DEFAULT_CONFIG = {
     "OCR": {
@@ -57,13 +65,15 @@ from config_migrate import ensure_new_schema
 
 
 def load_config(path: Path = None):
-    cfg_path = Path(path or CONFIG_FILE)
-    if not cfg_path.exists():
-        local = Path("config.json")
-        if local.exists():
-            cfg_path = local
-        else:
-            return deepcopy(DEFAULT_CONFIG)
+    """加载配置：优先个人目录 → 当前目录 → 默认"""
+    if path:
+        cfg_path = Path(path)
+    elif PERSONAL_CONFIG.exists():
+        cfg_path = PERSONAL_CONFIG
+    elif LOCAL_CONFIG.exists():
+        cfg_path = LOCAL_CONFIG
+    else:
+        return deepcopy(DEFAULT_CONFIG)
     try:
         with cfg_path.open("r", encoding="utf-8") as f:
             return json.load(f)
@@ -72,7 +82,13 @@ def load_config(path: Path = None):
 
 
 def save_config(config, path: Path = None):
-    cfg_path = Path(path or CONFIG_FILE)
+    """保存配置：优先保存到个人目录，不存在则保存到当前目录"""
+    if path:
+        cfg_path = Path(path)
+    elif PERSONAL_CONFIG.parent.exists():
+        cfg_path = PERSONAL_CONFIG
+    else:
+        cfg_path = LOCAL_CONFIG
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     with cfg_path.open("w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
@@ -182,6 +198,7 @@ def determine_word_count_bounds(original_count: int):
 # ================= Log signal =================
 class LogSignal(QObject):
     log_message = Signal(str)
+    task_status = Signal(str, str, str, str, str)
 
 
 # ================= Collapsible Section =================
@@ -232,10 +249,17 @@ class MainWindow(QMainWindow):
         self.config = ensure_new_schema(load_config())
         self.hidden_api_keys = {}
         self.task_queue = []
+        self.completed_tasks = set()  # 已完成的任务路径集合
+        self.finished_tasks = set()  # 当前运行批次中已经尝试过的任务路径集合
+        self.in_progress_tasks = set()  # 当前正在处理的任务路径集合
+        self.is_processing = False
+        self.max_parallel_tasks = 3
+        self.queue_lock = threading.Lock()
         self.log_signal = LogSignal()
         self.log_signal.log_message.connect(self._append_log)
+        self.log_signal.task_status.connect(self._update_task_status)
 
-        self.setWindowTitle("Composition OCR Assistant 作文修改助手 v1.0")
+        self.setWindowTitle("Composition OCR Assistant 作文修改助手 v1.1")
         self.resize(1100, 800)
 
         # Set icon
@@ -301,10 +325,17 @@ class MainWindow(QMainWindow):
 
     def _open_config_editor(self):
         from config_editor_ui import open_config_editor_form
+        # 确定实际配置文件路径
+        if PERSONAL_CONFIG.exists():
+            cfg_file = PERSONAL_CONFIG
+        elif LOCAL_CONFIG.exists():
+            cfg_file = LOCAL_CONFIG
+        else:
+            cfg_file = PERSONAL_CONFIG  # 默认保存到个人目录
         open_config_editor_form(
             parent=self,
             config=self.config,
-            config_file=CONFIG_FILE,
+            config_file=cfg_file,
             hidden_api_keys=self.hidden_api_keys,
             on_saved=self._on_config_saved,
         )
@@ -507,7 +538,7 @@ class MainWindow(QMainWindow):
         editor_group.setLayout(editor_layout)
         scroll_layout.addWidget(editor_group)
 
-        # ---- Path & Queue ----
+        # ---- Path & Start ----
         path_group = QGroupBox("文件路径与任务")
         path_layout = QVBoxLayout()
 
@@ -521,20 +552,19 @@ class MainWindow(QMainWindow):
         path_row.addWidget(btn_browse)
         path_layout.addLayout(path_row)
 
+        # Start button (放在路径下方、任务列表前)
+        btn_start = QPushButton("🚀 开始处理（自动读取路径下任务并开始）")
+        btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-size: 14px; padding: 8px;")
+        btn_start.clicked.connect(self._start_processing)
+        path_layout.addWidget(btn_start)
+
         path_group.setLayout(path_layout)
         scroll_layout.addWidget(path_group)
 
-        # Task queue
-        queue_header = QHBoxLayout()
-        queue_header.addWidget(QLabel("任务队列"))
-        queue_header.addStretch()
-        path_group.setLayout(path_layout)
-        scroll_layout.addWidget(path_group)
-
-        # Task queue table
+        # Task queue table (任务日志合一)
         self.queue_table = QTableWidget()
-        self.queue_table.setColumnCount(6)
-        self.queue_table.setHorizontalHeaderLabels(["序号", "学生姓名", "文件路径", "作文名称", "修改前字数", "任务状态"])
+        self.queue_table.setColumnCount(9)
+        self.queue_table.setHorizontalHeaderLabels(["序号", "学生姓名", "文件路径", "作文名称", "修改前字数", "当前步骤", "修改后字数", "状态", "实时日志"])
         header_view = self.queue_table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.Fixed)
         header_view.setSectionResizeMode(1, QHeaderView.Fixed)
@@ -542,15 +572,21 @@ class MainWindow(QMainWindow):
         header_view.setSectionResizeMode(3, QHeaderView.Fixed)
         header_view.setSectionResizeMode(4, QHeaderView.Fixed)
         header_view.setSectionResizeMode(5, QHeaderView.Fixed)
-        self.queue_table.setColumnWidth(0, 50)
-        self.queue_table.setColumnWidth(1, 120)
-        self.queue_table.setColumnWidth(3, 150)
-        self.queue_table.setColumnWidth(4, 100)
+        header_view.setSectionResizeMode(6, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(7, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(8, QHeaderView.Stretch)
+        self.queue_table.setColumnWidth(0, 40)
+        self.queue_table.setColumnWidth(1, 100)
+        self.queue_table.setColumnWidth(3, 120)
+        self.queue_table.setColumnWidth(4, 80)
         self.queue_table.setColumnWidth(5, 100)
+        self.queue_table.setColumnWidth(6, 80)
+        self.queue_table.setColumnWidth(7, 70)
         self.queue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.queue_table.verticalHeader().setVisible(False)
-        self.queue_table.setMaximumHeight(200)
+        self.queue_table.setMinimumHeight(280)
+        self.queue_table.setMaximumHeight(400)
         scroll_layout.addWidget(self.queue_table)
 
         queue_btns = QHBoxLayout()
@@ -558,29 +594,27 @@ class MainWindow(QMainWindow):
         btn_add_task.clicked.connect(self._add_task)
         btn_del_task = QPushButton("删除")
         btn_del_task.clicked.connect(self._remove_task)
+        btn_requeue_task = QPushButton("重新加入")
+        btn_requeue_task.clicked.connect(self._requeue_selected_tasks)
         btn_load_task = QPushButton("读取")
         btn_load_task.clicked.connect(self._load_tasks)
         btn_refresh_task = QPushButton("刷新队列")
         btn_refresh_task.clicked.connect(self._refresh_queue)
         queue_btns.addWidget(btn_add_task)
         queue_btns.addWidget(btn_del_task)
+        queue_btns.addWidget(btn_requeue_task)
         queue_btns.addStretch()
         queue_btns.addWidget(btn_load_task)
         queue_btns.addWidget(btn_refresh_task)
         scroll_layout.addLayout(queue_btns)
 
-        # Start button
-        btn_start = QPushButton("🚀 开始处理")
-        btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-size: 14px; padding: 8px;")
-        btn_start.clicked.connect(self._start_processing)
-        scroll_layout.addWidget(btn_start)
-
-        # Log
-        scroll_layout.addWidget(QLabel("运行日志"))
+        # Log (collapsible)
+        self.log_section = CollapsibleSection("运行日志", collapsed=True)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(180)
-        scroll_layout.addWidget(self.log_text)
+        self.log_text.setMaximumHeight(360)
+        self.log_section.add_widget(self.log_text)
+        scroll_layout.addWidget(self.log_section)
 
         scroll_layout.addStretch()
         scroll.setWidget(scroll_widget)
@@ -616,12 +650,27 @@ class MainWindow(QMainWindow):
 
     # ---- Task Queue ----
     def _refresh_queue(self):
-        self.task_queue = [p for p in self.task_queue if os.path.isdir(p)]
+        with self.queue_lock:
+            self.task_queue = [p for p in self.task_queue if os.path.isdir(p)]
         self._render_queue()
 
     def _render_queue(self):
+        old_rows = {}
+        for row in range(self.queue_table.rowCount()):
+            path_item = self.queue_table.item(row, 2)
+            if path_item:
+                old_rows[path_item.text()] = {
+                    "step": self.queue_table.item(row, 5).text() if self.queue_table.item(row, 5) else "-",
+                    "after_count": self.queue_table.item(row, 6).text() if self.queue_table.item(row, 6) else "-",
+                    "status": self.queue_table.item(row, 7).text() if self.queue_table.item(row, 7) else "待完成",
+                    "log": self.queue_table.item(row, 8).text() if self.queue_table.item(row, 8) else "等待开始...",
+                }
+        status_colors = {"待完成": "#cfe2ff", "处理中": "#fff3bf", "已完成": "#d4edda", "失败": "#f8d7da"}
+
         self.queue_table.setRowCount(0)
-        for i, task_path in enumerate(self.task_queue, start=1):
+        with self.queue_lock:
+            task_paths = list(self.task_queue)
+        for i, task_path in enumerate(task_paths, start=1):
             folder_name = os.path.basename(task_path)
             student, essay = infer_student_and_essay(folder_name)
             count = count_existing_docx_chars(task_path)
@@ -632,11 +681,29 @@ class MainWindow(QMainWindow):
             self.queue_table.setItem(row, 2, QTableWidgetItem(task_path))
             self.queue_table.setItem(row, 3, QTableWidgetItem(essay))
             self.queue_table.setItem(row, 4, QTableWidgetItem(count))
-            self.queue_table.setItem(row, 5, QTableWidgetItem("待完成"))
-            # Color
-            for col in range(6):
+            if task_path in old_rows:
+                row_state = old_rows[task_path]
+                self.queue_table.setItem(row, 5, QTableWidgetItem(row_state["step"]))
+                self.queue_table.setItem(row, 6, QTableWidgetItem(row_state["after_count"]))
+                self.queue_table.setItem(row, 7, QTableWidgetItem(row_state["status"]))
+                self.queue_table.setItem(row, 8, QTableWidgetItem(row_state["log"]))
+                bg_color = QColor(status_colors.get(row_state["status"], "#ffffff"))
+            elif task_path in self.completed_tasks:
+                self.queue_table.setItem(row, 5, QTableWidgetItem("完成"))
+                self.queue_table.setItem(row, 6, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 7, QTableWidgetItem("已完成"))
+                self.queue_table.setItem(row, 8, QTableWidgetItem("之前已处理完成，跳过"))
+                bg_color = QColor("#d4edda")
+            else:
+                self.queue_table.setItem(row, 5, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 6, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 7, QTableWidgetItem("待完成"))
+                self.queue_table.setItem(row, 8, QTableWidgetItem("等待开始..."))
+                bg_color = QColor("#cfe2ff")
+            for col in range(9):
                 item = self.queue_table.item(row, col)
-                item.setBackground(QColor("#cfe2ff"))
+                if item:
+                    item.setBackground(bg_color)
 
     def _add_task(self):
         folder = QFileDialog.getExistingDirectory(self, "选择任务文件夹")
@@ -649,7 +716,11 @@ class MainWindow(QMainWindow):
         if folder in self.task_queue:
             self.log_signal.log_message.emit(f"已存在：{folder}")
             return
-        self.task_queue.append(folder)
+        with self.queue_lock:
+            self.task_queue.append(folder)
+            self.finished_tasks.discard(folder)
+            self.completed_tasks.discard(folder)
+            self.in_progress_tasks.discard(folder)
         self._render_queue()
         self.log_signal.log_message.emit(f"已添加任务：{folder}")
 
@@ -660,8 +731,43 @@ class MainWindow(QMainWindow):
             return
         for idx in sorted(rows, reverse=True):
             path = self.queue_table.item(idx.row(), 2).text()
-            if path in self.task_queue:
-                self.task_queue.remove(path)
+            with self.queue_lock:
+                if path in self.task_queue:
+                    self.task_queue.remove(path)
+                # 删除时清除完成标记，重新加入可再处理
+                self.completed_tasks.discard(path)
+                self.finished_tasks.discard(path)
+                self.in_progress_tasks.discard(path)
+        self._refresh_queue()
+
+    def _requeue_selected_tasks(self):
+        rows = self.queue_table.selectionModel().selectedRows()
+        if not rows:
+            self.log_signal.log_message.emit("请先选择要重新加入的队列项")
+            return
+
+        requeued = 0
+        skipped_running = 0
+        for idx in rows:
+            path_item = self.queue_table.item(idx.row(), 2)
+            if not path_item:
+                continue
+            task_path = path_item.text()
+            with self.queue_lock:
+                if task_path in self.in_progress_tasks:
+                    skipped_running += 1
+                    continue
+                if task_path not in self.task_queue:
+                    self.task_queue.append(task_path)
+                self.completed_tasks.discard(task_path)
+                self.finished_tasks.discard(task_path)
+            self.log_signal.task_status.emit(task_path, "pending", "等待重试", "", "手动重新加入队列")
+            requeued += 1
+
+        if requeued:
+            self.log_signal.log_message.emit(f"已重新加入 {requeued} 个任务")
+        if skipped_running:
+            self.log_signal.log_message.emit(f"{skipped_running} 个任务正在处理中，已跳过")
         self._refresh_queue()
 
     def _load_tasks(self):
@@ -671,28 +777,92 @@ class MainWindow(QMainWindow):
             return
         candidates = scan_folder_for_tasks(folder)
         added = 0
-        for p in candidates:
-            if p not in self.task_queue:
-                self.task_queue.append(p)
-                added += 1
+        with self.queue_lock:
+            for p in candidates:
+                if p not in self.task_queue:
+                    self.task_queue.append(p)
+                    self.completed_tasks.discard(p)
+                    self.finished_tasks.discard(p)
+                    self.in_progress_tasks.discard(p)
+                    added += 1
         self.log_signal.log_message.emit(f"已读取并加入 {added} 个任务" if added else "没有新任务")
         self._render_queue()
 
-    def _update_task_status(self, task_path: str, status: str):
-        labels = {"pending": "待完成", "running": "正在改", "done": "修改完成", "failed": "修改失败"}
+    def _update_task_status(self, task_path: str, status: str, step: str = "", after_count: str = "", log_msg: str = ""):
+        """更新任务状态，支持实时步骤、修改后字数和日志"""
+        labels = {"pending": "待完成", "running": "处理中", "done": "已完成", "failed": "失败"}
         colors = {"pending": "#cfe2ff", "running": "#fff3bf", "done": "#d4edda", "failed": "#f8d7da"}
         for row in range(self.queue_table.rowCount()):
             if self.queue_table.item(row, 2) and self.queue_table.item(row, 2).text() == task_path:
-                self.queue_table.item(row, 5).setText(labels.get(status, status))
-                for col in range(6):
-                    item = self.queue_table.item(row, col)
-                    if item:
-                        item.setBackground(QColor(colors.get(status, "#ffffff")))
+                if step:
+                    self.queue_table.item(row, 5).setText(step)
+                if after_count:
+                    self.queue_table.item(row, 6).setText(after_count)
+                if status:
+                    self.queue_table.item(row, 7).setText(labels.get(status, status))
+                if log_msg:
+                    old_log = self.queue_table.item(row, 8).text()
+                    if old_log == "等待开始...":
+                        self.queue_table.item(row, 8).setText(log_msg)
+                    else:
+                        self.queue_table.item(row, 8).setText(old_log + "\n" + log_msg)
+                    self.queue_table.scrollToItem(self.queue_table.item(row, 8))
+                if status:
+                    for col in range(9):
+                        item = self.queue_table.item(row, col)
+                        if item:
+                            item.setBackground(QColor(colors.get(status, "#ffffff")))
+                # 完成的任务加入标记集合
+                if status == "done":
+                    with self.queue_lock:
+                        self.completed_tasks.add(task_path)
+                        self.finished_tasks.add(task_path)
+                elif status == "failed":
+                    with self.queue_lock:
+                        self.finished_tasks.add(task_path)
+                elif status == "pending":
+                    with self.queue_lock:
+                        self.completed_tasks.discard(task_path)
+                        self.finished_tasks.discard(task_path)
+                        self.in_progress_tasks.discard(task_path)
                 break
 
     # ---- Start Processing ----
     def _start_processing(self):
+        # 自动读取路径下的任务加入队列
+        folder = self.path_entry.text().strip()
+        added = 0
+        requeued_tasks = []
+        if folder and os.path.isdir(folder):
+            candidates = scan_folder_for_tasks(folder)
+            with self.queue_lock:
+                for task_path in candidates:
+                    if task_path not in self.task_queue:
+                        self.task_queue.append(task_path)
+                        self.completed_tasks.discard(task_path)
+                        self.finished_tasks.discard(task_path)
+                        self.in_progress_tasks.discard(task_path)
+                        added += 1
+        with self.queue_lock:
+            # 每次点击开始时，只跳过已完成任务；失败/未完成任务重新进入本批次。
+            for task_path in self.task_queue:
+                if task_path not in self.completed_tasks and task_path not in self.in_progress_tasks:
+                    if task_path in self.finished_tasks:
+                        requeued_tasks.append(task_path)
+                    self.finished_tasks.discard(task_path)
+            should_start_worker = not self.is_processing
+            if should_start_worker:
+                self.is_processing = True
+        if added:
+            self.log_signal.log_message.emit(f"已自动读取 {added} 个任务")
+        for task_path in requeued_tasks:
+            self.log_signal.task_status.emit(task_path, "pending", "等待重试", "", "重新加入队列")
         self._refresh_queue()
+
+        if not should_start_worker:
+            self.log_signal.log_message.emit("当前已有任务在处理，新加入的任务会排队继续处理")
+            return
+
         threading.Thread(target=self._run_processing, daemon=True).start()
 
     def _run_processing(self):
@@ -738,15 +908,21 @@ class MainWindow(QMainWindow):
                 count_min = int(min_text)
             except ValueError:
                 self.log_signal.log_message.emit("目标字数范围最小值必须是整数")
+                with self.queue_lock:
+                    self.is_processing = False
                 return
         if max_text:
             try:
                 count_max = int(max_text)
             except ValueError:
                 self.log_signal.log_message.emit("目标字数范围最大值必须是整数")
+                with self.queue_lock:
+                    self.is_processing = False
                 return
         if count_min is not None and count_max is not None and count_min > count_max:
             self.log_signal.log_message.emit("目标字数范围最小值不能大于最大值")
+            with self.queue_lock:
+                self.is_processing = False
             return
 
         cfg["LLM"]["TASKS"].setdefault("editor", {})
@@ -763,10 +939,14 @@ class MainWindow(QMainWindow):
 
         if not all([cfg.get("OCR", {}).get("XFYUN", {}).get("URL"), cfg.get("OCR", {}).get("XFYUN", {}).get("APPID"), cfg.get("OCR", {}).get("XFYUN", {}).get("API_KEY"), cfg.get("APP", {}).get("ROOT_DIR")]):
             self.log_signal.log_message.emit("请填写完整的 OCR 配置和文件夹路径")
+            with self.queue_lock:
+                self.is_processing = False
             return
 
         if not os.path.isdir(cfg["APP"]["ROOT_DIR"]):
             self.log_signal.log_message.emit("文件夹路径无效")
+            with self.queue_lock:
+                self.is_processing = False
             return
 
         save_config(cfg)
@@ -776,23 +956,96 @@ class MainWindow(QMainWindow):
         if cfg.get("OCR", {}).get("BAIDU_CORRECTION", {}).get("ENABLED"):
             self.log_signal.log_message.emit("百度图片矫正：已启用")
 
-        def task_status_cb(folder_path, status):
-            QTimer.singleShot(0, lambda p=folder_path, s=status: self._update_task_status(p, s))
+        def task_status_cb(folder_path, status, step="", log_msg="", after_count=""):
+            self.log_signal.task_status.emit(
+                folder_path,
+                status,
+                step or "",
+                str(after_count) if after_count else "",
+                log_msg or "",
+            )
 
         try:
-            self.log_signal.log_message.emit("开始处理...")
-            from ocr_main import process_all
-            process_all(
-                cfg["APP"]["ROOT_DIR"],
-                log_callback=lambda msg: self.log_signal.log_message.emit(msg),
-                use_typo_fix=bool(tasks_cfg.get("typo_fix", {}).get("ENABLED", False)),
-                use_editor=bool(tasks_cfg.get("editor", {}).get("ENABLED", False)),
-                cfg=cfg,
-                task_status_callback=task_status_cb,
-            )
+            self.log_signal.log_message.emit(f"开始处理...（并发数：{self.max_parallel_tasks}）")
+            from ocr_main import process_folder
+
+            def process_one_task(task_path):
+                task_name = os.path.basename(task_path)
+
+                def task_log(msg):
+                    self.log_signal.log_message.emit(f"[{task_name}] {msg}")
+                    self.log_signal.task_status.emit(task_path, "", "", "", msg or "")
+
+                try:
+                    self.log_signal.task_status.emit(task_path, "running", "排队启动", "", "开始处理")
+                    task_log(f"处理: {task_path}")
+                    process_folder(
+                        task_path,
+                        log_callback=task_log,
+                        use_typo_fix=bool(tasks_cfg.get("typo_fix", {}).get("ENABLED", False)),
+                        use_editor=bool(tasks_cfg.get("editor", {}).get("ENABLED", False)),
+                        task_status_callback=task_status_cb,
+                    )
+                except Exception as exc:
+                    self.log_signal.task_status.emit(task_path, "failed", "", "", f"失败: {exc}")
+                    self.log_signal.log_message.emit(f"[{task_name}] 处理失败：{exc}")
+
+            started_any = False
+            futures = {}
+            with ThreadPoolExecutor(max_workers=self.max_parallel_tasks) as executor:
+                while True:
+                    with self.queue_lock:
+                        slots = self.max_parallel_tasks - len(futures)
+                        pending_tasks = [
+                            p for p in self.task_queue
+                            if p not in self.finished_tasks and p not in self.in_progress_tasks
+                        ]
+                        next_tasks = pending_tasks[:max(0, slots)]
+                        for task_path in next_tasks:
+                            if os.path.isdir(task_path):
+                                self.in_progress_tasks.add(task_path)
+                            else:
+                                self.finished_tasks.add(task_path)
+
+                    for task_path in next_tasks:
+                        if not os.path.isdir(task_path):
+                            continue
+                        started_any = True
+                        futures[executor.submit(process_one_task, task_path)] = task_path
+
+                    if not futures:
+                        with self.queue_lock:
+                            has_more = any(
+                                p not in self.finished_tasks and p not in self.in_progress_tasks
+                                for p in self.task_queue
+                            )
+                            if not has_more:
+                                self.is_processing = False
+                        if not has_more:
+                            if not started_any:
+                                self.log_signal.log_message.emit("没有待处理的任务（已完成的任务已跳过）")
+                            break
+
+                    done_futures, _ = wait(futures.keys(), timeout=0.3, return_when=FIRST_COMPLETED)
+                    for future in done_futures:
+                        task_path = futures.pop(future)
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            self.log_signal.task_status.emit(task_path, "failed", "", "", f"失败: {exc}")
+                            self.log_signal.log_message.emit(f"[{os.path.basename(task_path)}] 处理失败：{exc}")
+                        finally:
+                            with self.queue_lock:
+                                self.in_progress_tasks.discard(task_path)
+                                self.finished_tasks.add(task_path)
+
             self.log_signal.log_message.emit("全部处理完成")
         except Exception as e:
             self.log_signal.log_message.emit(f"处理失败：{e}")
+        finally:
+            with self.queue_lock:
+                self.in_progress_tasks.clear()
+                self.is_processing = False
 
     # ===================== PAGE 2: AI DOCX =====================
     def _init_page_ai(self):
@@ -904,12 +1157,13 @@ class MainWindow(QMainWindow):
         btn_start_ai.clicked.connect(self._start_ai_workflow)
         scroll_layout.addWidget(btn_start_ai)
 
-        # Log
-        scroll_layout.addWidget(QLabel("处理日志"))
+        # Log (collapsible)
+        self.ai_log_section = CollapsibleSection("处理日志", collapsed=True)
         self.ai_log_text = QTextEdit()
         self.ai_log_text.setReadOnly(True)
         self.ai_log_text.setMaximumHeight(200)
-        scroll_layout.addWidget(self.ai_log_text)
+        self.ai_log_section.add_widget(self.ai_log_text)
+        scroll_layout.addWidget(self.ai_log_section)
 
         scroll_layout.addStretch()
         scroll.setWidget(scroll_widget)
@@ -1000,27 +1254,41 @@ class MainWindow(QMainWindow):
             return
 
         enabled_tasks = sorted([(t["id"], t["order"]) for t in self.task_config if t["enabled"]], key=lambda x: x[1])
+        task_step_names = {"6": "DOC转DOCX", "1": "清除空格", "AI": "AI改作文", "2": "添加标签", "3": "格式化", "5": "改作者"}
+
+        def update_step(task_path, step_name):
+            QTimer.singleShot(0, lambda p=task_path, s=step_name: self._update_task_status(p, "running", step=step_name))
 
         try:
             for task_id, _ in enabled_tasks:
+                step_name = task_step_names.get(task_id, task_id)
+                self._append_log_ai(f"【{step_name}】开始...")
+                # 更新所有任务的当前步骤
+                for tp in copied_files:
+                    folder_of_file = os.path.join(folder, os.path.dirname(tp))
+                    update_step(folder_of_file, step_name)
+
                 if task_id == "6":
-                    self._append_log_ai("【步骤 6】转换 DOC -> DOCX...")
                     self._convert_docs(folder)
                 elif task_id == "1":
-                    self._append_log_ai("【步骤 1】清除空格...")
                     self._clear_spaces(folder)
                 elif task_id == "AI":
-                    self._append_log_ai("【步骤 AI】发送给 AI 修正...")
                     self._process_ai(folder, api_key, base_url, prompt, count_min=count_min, count_max=count_max)
                 elif task_id == "2":
-                    self._append_log_ai("【步骤 2】添加标签...")
                     self._add_labels(folder)
                 elif task_id == "3":
-                    self._append_log_ai("【步骤 3】格式化...")
                     self._format_docs(folder)
                 elif task_id == "5":
-                    self._append_log_ai("【步骤 5】修改作者...")
                     self._set_author(folder)
+
+            # 更新完成状态和修改后字数
+            for root_dir, files in iter_files_limited(folder, max_depth=4):
+                for file in files:
+                    if file.startswith("改 ") and file.endswith(".docx"):
+                        full_path = os.path.join(root_dir, file)
+                        after_count = count_existing_docx_chars(os.path.dirname(full_path))
+                        QTimer.singleShot(0, lambda p=full_path, c=after_count: self._update_task_status(p, "done", step="完成", after_count=c))
+
             self._append_log_ai("所有流程完成！")
         except Exception as e:
             self._append_log_ai(f"处理失败：{e}")
