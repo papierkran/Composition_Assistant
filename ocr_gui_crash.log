@@ -1,0 +1,30 @@
+
+[2026-05-19 17:01:47] 未捕获异常
+Traceback (most recent call last):
+  File "c:\Users\WINNAS\Desktop\workfold\tools\Composition_OCR_Assistant\config_editor_ui.py", line 196, in _on_add
+    _render_providers()
+    ~~~~~~~~~~~~~~~~~^^
+  File "c:\Users\WINNAS\Desktop\workfold\tools\Composition_OCR_Assistant\config_editor_ui.py", line 165, in _render_providers
+    w = providers_container.takeAt().widget()
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+TypeError: QVBoxLayout.takeAt() takes exactly one argument (0 given)
+
+
+[2026-05-19 17:02:03] 未捕获异常
+Traceback (most recent call last):
+  File "c:\Users\WINNAS\Desktop\workfold\tools\Composition_OCR_Assistant\ocr_gui.py", line 1143, in <lambda>
+    btn_new_ai.clicked.connect(lambda: self._add_provider(self.ai_provider_combo))
+                                       ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\Users\WINNAS\Desktop\workfold\tools\Composition_OCR_Assistant\ocr_gui.py", line 690, in _add_provider
+    p_name = _normalize_provider_exists(self.config, name.strip())
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+NameError: name '_normalize_provider_exists' is not defined. Did you mean: '_normalize_provider_name'?
+
+
+[2026-06-02 03:17:32] 未捕获异常
+Traceback (most recent call last):
+  File "c:\Users\WINNAS\Desktop\workfold\tools\Composition_OCR_Assistant\ocr_gui.py", line 831, in _requeue_selected_tasks
+    self.log_signal.task_status.emit(task_path, "pending", "等待重试", "", "手动重新加入队列")
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: task_status(QString,QString,QString,QString,QString,QString,QString) needs 7 argument(s), 5 given!
+

@@ -1,0 +1,154 @@
+[2026-05-16 18:07:10] main: start
+[2026-05-16 18:07:10] main: QApplication created
+[2026-05-16 18:07:10] main: MainWindow created
+[2026-05-16 18:07:10] main: window shown visible=True
+[2026-05-16 18:09:24] main: start
+[2026-05-16 18:09:24] main: QApplication created
+[2026-05-16 18:09:24] main: MainWindow created
+[2026-05-16 18:09:25] main: window shown visible=True
+[2026-05-16 18:19:53] main: start
+[2026-05-16 18:19:53] main: QApplication created
+[2026-05-16 18:19:53] main: MainWindow created
+[2026-05-16 18:19:53] main: window shown visible=True
+[2026-05-16 18:38:39] main: start
+[2026-05-16 18:38:39] main: QApplication created
+[2026-05-16 18:38:39] main: MainWindow created
+[2026-05-16 18:38:39] main: window shown visible=True
+[2026-05-16 18:38:53] main: app.exec returned 0
+[2026-05-16 18:39:34] main: start
+[2026-05-16 18:39:34] main: QApplication created
+[2026-05-16 18:39:34] main: MainWindow created
+[2026-05-16 18:39:34] main: window shown visible=True
+[2026-05-19 03:26:25] main: app.exec returned 0
+[2026-05-19 16:57:39] main: start
+[2026-05-19 16:57:39] main: QApplication created
+[2026-05-19 16:57:39] main: MainWindow created
+[2026-05-19 16:57:39] main: window shown visible=True
+[2026-05-19 17:02:16] main: app.exec returned 0
+[2026-05-19 17:02:20] main: start
+[2026-05-19 17:02:20] main: QApplication created
+[2026-05-19 17:02:20] main: MainWindow created
+[2026-05-19 17:02:20] main: window shown visible=True
+[2026-05-20 22:34:55] main: start
+[2026-05-20 22:34:55] main: QApplication created
+[2026-05-20 22:34:56] main: MainWindow created
+[2026-05-20 22:34:56] main: window shown visible=True
+[2026-05-22 00:12:06] main: app.exec returned 0
+[2026-05-22 00:12:10] main: start
+[2026-05-22 00:12:10] main: QApplication created
+[2026-05-22 00:12:10] main: MainWindow created
+[2026-05-22 00:12:10] main: window shown visible=True
+[2026-05-22 16:54:22] main: start
+[2026-05-22 16:54:22] main: QApplication created
+[2026-05-22 16:54:22] main: MainWindow created
+[2026-05-22 16:54:22] main: window shown visible=True
+[2026-05-27 14:47:13] main: start
+[2026-05-27 14:47:13] main: QApplication created
+[2026-05-27 14:47:13] main: MainWindow created
+[2026-05-27 14:47:14] main: window shown visible=True
+[2026-05-27 19:34:32] main: start
+[2026-05-27 19:34:32] main: QApplication created
+[2026-05-27 19:34:32] main: MainWindow created
+[2026-05-27 19:34:32] main: window shown visible=True
+[2026-05-28 02:34:28] main: app.exec returned 0
+[2026-05-28 18:49:59] main: start
+[2026-05-28 18:49:59] main: QApplication created
+[2026-05-28 18:50:00] main: MainWindow created
+[2026-05-28 18:50:00] main: window shown visible=True
+[2026-05-31 23:15:28] main: start
+[2026-05-31 23:15:28] main: QApplication created
+[2026-05-31 23:15:28] main: MainWindow created
+[2026-05-31 23:15:29] main: window shown visible=True
+[2026-06-01 17:51:51] main: start
+[2026-06-01 17:51:51] main: QApplication created
+[2026-06-01 17:51:52] main: MainWindow created
+[2026-06-01 17:51:52] main: window shown visible=True
+[2026-06-02 02:59:12] main: app.exec returned 0
+[2026-06-02 03:00:31] main: start
+[2026-06-02 03:00:31] main: QApplication created
+[2026-06-02 03:00:32] main: MainWindow created
+[2026-06-02 03:00:32] main: window shown visible=True
+[2026-06-02 03:16:29] main: app.exec returned 0
+[2026-06-02 03:16:31] main: start
+[2026-06-02 03:16:31] main: QApplication created
+[2026-06-02 03:16:32] main: MainWindow created
+[2026-06-02 03:16:32] main: window shown visible=True
+[2026-06-02 03:22:12] main: app.exec returned 0
+[2026-06-02 03:22:15] main: start
+[2026-06-02 03:22:15] main: QApplication created
+[2026-06-02 03:22:15] main: MainWindow created
+[2026-06-02 03:22:15] main: window shown visible=True
+[2026-06-02 03:25:10] main: app.exec returned 0
+[2026-06-02 03:25:12] main: start
+[2026-06-02 03:25:12] main: QApplication created
+[2026-06-02 03:25:13] main: MainWindow created
+[2026-06-02 03:25:13] main: window shown visible=True
+[2026-06-02 03:37:23] main: app.exec returned 0
+[2026-06-02 03:37:26] main: start
+[2026-06-02 03:37:26] main: QApplication created
+[2026-06-02 03:37:26] main: MainWindow created
+[2026-06-02 03:37:26] main: window shown visible=True
+[2026-06-02 03:40:09] main: app.exec returned 0
+[2026-06-02 03:40:22] main: start
+[2026-06-02 03:40:22] main: QApplication created
+[2026-06-02 03:40:22] main: MainWindow created
+[2026-06-02 03:40:22] main: window shown visible=True
+[2026-06-02 03:41:37] main: start
+[2026-06-02 03:41:37] main: QApplication created
+[2026-06-02 03:41:37] main: MainWindow created
+[2026-06-02 03:41:37] main: window shown visible=True
+[2026-06-02 03:42:01] main: app.exec returned 0
+[2026-06-02 03:42:13] main: start
+[2026-06-02 03:42:13] main: QApplication created
+[2026-06-02 03:42:13] main: MainWindow created
+[2026-06-02 03:42:13] main: window shown visible=True
+[2026-06-02 03:43:23] main: app.exec returned 0
+[2026-06-02 03:45:40] main: start
+[2026-06-02 03:45:40] main: QApplication created
+[2026-06-02 03:45:41] main: MainWindow created
+[2026-06-02 03:45:41] main: window shown visible=True
+[2026-06-02 03:48:03] main: start
+[2026-06-02 03:48:03] main: QApplication created
+[2026-06-02 03:48:04] main: MainWindow created
+[2026-06-02 03:48:04] main: window shown visible=True
+[2026-06-02 03:48:23] main: app.exec returned 0
+[2026-06-02 03:49:09] main: start
+[2026-06-02 03:49:09] main: QApplication created
+[2026-06-02 03:49:09] main: MainWindow created
+[2026-06-02 03:49:09] main: window shown visible=True
+[2026-06-02 03:56:03] main: app.exec returned 0
+[2026-06-02 03:56:13] main: start
+[2026-06-02 03:56:13] main: QApplication created
+[2026-06-02 03:56:13] main: MainWindow created
+[2026-06-02 03:56:14] main: window shown visible=True
+[2026-06-02 04:01:42] main: app.exec returned 0
+[2026-06-02 04:01:54] main: start
+[2026-06-02 04:01:54] main: QApplication created
+[2026-06-02 04:01:55] main: MainWindow created
+[2026-06-02 04:01:55] main: window shown visible=True
+[2026-06-02 04:05:28] main: app.exec returned 0
+[2026-06-02 04:05:47] main: start
+[2026-06-02 04:05:47] main: QApplication created
+[2026-06-02 04:05:47] main: MainWindow created
+[2026-06-02 04:05:48] main: window shown visible=True
+[2026-06-02 04:16:16] main: app.exec returned 0
+[2026-06-02 04:19:34] main: start
+[2026-06-02 04:19:34] main: QApplication created
+[2026-06-02 04:19:34] main: MainWindow created
+[2026-06-02 04:19:34] main: window shown visible=True
+[2026-06-02 04:23:46] main: app.exec returned 0
+[2026-06-02 04:29:28] main: start
+[2026-06-02 04:29:28] main: QApplication created
+[2026-06-02 04:29:28] main: MainWindow created
+[2026-06-02 04:29:28] main: window shown visible=True
+[2026-06-02 04:39:28] main: app.exec returned 0
+[2026-06-02 04:39:53] main: start
+[2026-06-02 04:39:53] main: QApplication created
+[2026-06-02 04:39:53] main: MainWindow created
+[2026-06-02 04:39:53] main: window shown visible=True
+[2026-06-02 04:41:05] main: app.exec returned 0
+[2026-06-02 04:41:06] main: start
+[2026-06-02 04:41:06] main: QApplication created
+[2026-06-02 04:41:06] main: MainWindow created
+[2026-06-02 04:41:07] main: window shown visible=True
+[2026-06-02 04:41:11] main: app.exec returned 0

@@ -1,6 +1,8 @@
 import base64
 import json
+import shutil
 import threading
+import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 import sys
@@ -35,6 +37,9 @@ def _exe_dir() -> Path:
 
 PERSONAL_CONFIG = Path(r"D:\person_data\ocer助手\presson.json")
 LOCAL_CONFIG = _exe_dir() / "config.json"
+PROJECT_DIR = Path(__file__).resolve().parent
+CRASH_LOG = _exe_dir() / "ocr_gui_crash.log"
+STARTUP_LOG = _exe_dir() / "ocr_gui_startup.log"
 
 DEFAULT_CONFIG = {
     "OCR": {
@@ -60,6 +65,49 @@ DEFAULT_CONFIG = {
     },
     "APP": {"ROOT_DIR": "", "DEBUG": False},
 }
+
+
+def _is_bad_marshal_error(exc: BaseException) -> bool:
+    return "bad marshal data" in str(exc).lower()
+
+
+def _clear_project_bytecode_caches():
+    """Remove local bytecode caches that can break after switching Python versions."""
+    if getattr(sys, "frozen", False):
+        return
+    for cache_dir in PROJECT_DIR.rglob("__pycache__"):
+        try:
+            shutil.rmtree(cache_dir)
+        except OSError:
+            pass
+
+
+def _format_exception_for_log(exc: BaseException) -> str:
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+    if _is_bad_marshal_error(exc):
+        detail += "\n\n提示：bad marshal data 通常是 Python 字节码缓存（.pyc）版本不匹配或损坏导致的。程序已尝试清理项目内 __pycache__，如仍失败请重新打包/重启程序。"
+    return detail
+
+
+def _write_crash_log(exc_type, exc, tb):
+    try:
+        with CRASH_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 未捕获异常\n")
+            f.write("".join(traceback.format_exception(exc_type, exc, tb)))
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def _write_startup_log(message: str):
+    try:
+        with STARTUP_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except Exception:
+        pass
+
+
+sys.excepthook = _write_crash_log
 
 from config_migrate import ensure_new_schema
 
@@ -170,19 +218,6 @@ def infer_student_and_essay(folder_name: str):
     return folder_name, folder_name
 
 
-def count_existing_docx_chars(folder_path: str) -> str:
-    try:
-        doc_name = os.path.basename(folder_path)
-        docx_path = os.path.join(folder_path, f"{doc_name}.docx")
-        if os.path.isfile(docx_path):
-            doc = Document(docx_path)
-            total = sum(len(p.text.strip()) for p in doc.paragraphs if p.text.strip())
-            return str(total)
-    except Exception:
-        pass
-    return ""
-
-
 def count_chinese_characters(text: str) -> int:
     return sum(1 for ch in text if not ch.isspace())
 
@@ -198,7 +233,13 @@ def determine_word_count_bounds(original_count: int):
 # ================= Log signal =================
 class LogSignal(QObject):
     log_message = Signal(str)
-    task_status = Signal(str, str, str, str, str)
+    task_status = Signal(str, str, str, str, str, str, str, str, str)  # +essay_title
+    ai_log_message = Signal(str)
+    ai_tasks_loaded = Signal(list)
+    ai_task_status = Signal(str, str, str, str, str)
+    doc_ai_log_message = Signal(str)
+    doc_ai_tasks_loaded = Signal(list)
+    doc_ai_task_status = Signal(str, str, str)  # task_path, status, log_msg
 
 
 # ================= Collapsible Section =================
@@ -246,6 +287,7 @@ class CollapsibleSection(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        _clear_project_bytecode_caches()
         self.config = ensure_new_schema(load_config())
         self.hidden_api_keys = {}
         self.task_queue = []
@@ -258,6 +300,12 @@ class MainWindow(QMainWindow):
         self.log_signal = LogSignal()
         self.log_signal.log_message.connect(self._append_log)
         self.log_signal.task_status.connect(self._update_task_status)
+        self.log_signal.ai_tasks_loaded.connect(self._render_ai_queue)
+        self.log_signal.ai_log_message.connect(self._append_log_ai)
+        self.log_signal.ai_task_status.connect(self._update_ai_task_status)
+        self.log_signal.doc_ai_log_message.connect(self._append_log_doc_ai)
+        self.log_signal.doc_ai_tasks_loaded.connect(self._render_doc_ai_queue)
+        self.log_signal.doc_ai_task_status.connect(self._update_doc_ai_task_status)
 
         self.setWindowTitle("Composition OCR Assistant 作文修改助手 v1.1")
         self.resize(1100, 800)
@@ -283,11 +331,14 @@ class MainWindow(QMainWindow):
         self.btn_ocr.setFixedWidth(120)
         self.btn_ai = QPushButton("docx作文处理")
         self.btn_ai.setFixedWidth(120)
+        self.btn_doc_ai = QPushButton("文档ai识别修改")
+        self.btn_doc_ai.setFixedWidth(140)
         self.btn_config = QPushButton("配置编辑")
         self.btn_config.setFixedWidth(100)
         self.btn_config.clicked.connect(self._open_config_editor)
         top_bar.addWidget(self.btn_ocr)
         top_bar.addWidget(self.btn_ai)
+        top_bar.addWidget(self.btn_doc_ai)
         top_bar.addStretch()
         top_bar.addWidget(self.btn_config)
         main_layout.addLayout(top_bar)
@@ -295,25 +346,33 @@ class MainWindow(QMainWindow):
         # Page stack
         self.page_ocr = QWidget()
         self.page_ai = QWidget()
+        self.page_doc_ai = QWidget()
         self.page_ocr.hide()
         self.page_ai.hide()
+        self.page_doc_ai.hide()
         main_layout.addWidget(self.page_ocr)
         main_layout.addWidget(self.page_ai)
+        main_layout.addWidget(self.page_doc_ai)
 
         self.btn_ocr.clicked.connect(lambda: self._show_page("ocr"))
         self.btn_ai.clicked.connect(lambda: self._show_page("ai"))
+        self.btn_doc_ai.clicked.connect(lambda: self._show_page("doc_ai"))
 
         self._init_page_ocr()
         self._init_page_ai()
+        self._init_page_doc_ai()
         self._show_page("ocr")
 
     def _show_page(self, name):
         self.page_ocr.hide()
         self.page_ai.hide()
+        self.page_doc_ai.hide()
         if name == "ocr":
             self.page_ocr.show()
-        else:
+        elif name == "ai":
             self.page_ai.show()
+        else:
+            self.page_doc_ai.show()
 
     def _append_log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -322,6 +381,10 @@ class MainWindow(QMainWindow):
     def _append_log_ai(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         self.ai_log_text.append(f"[{ts}] {msg}")
+
+    def _append_log_doc_ai(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.doc_ai_log_text.append(f"[{ts}] {msg}")
 
     def _open_config_editor(self):
         from config_editor_ui import open_config_editor_form
@@ -563,8 +626,8 @@ class MainWindow(QMainWindow):
 
         # Task queue table (任务日志合一)
         self.queue_table = QTableWidget()
-        self.queue_table.setColumnCount(9)
-        self.queue_table.setHorizontalHeaderLabels(["序号", "学生姓名", "文件路径", "作文名称", "修改前字数", "当前步骤", "修改后字数", "状态", "实时日志"])
+        self.queue_table.setColumnCount(10)
+        self.queue_table.setHorizontalHeaderLabels(["序号", "学生姓名", "文件路径", "作文名称", "修改前字数", "年级", "线上/线下", "修改后字数", "状态", "实时日志"])
         header_view = self.queue_table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.Fixed)
         header_view.setSectionResizeMode(1, QHeaderView.Fixed)
@@ -574,14 +637,16 @@ class MainWindow(QMainWindow):
         header_view.setSectionResizeMode(5, QHeaderView.Fixed)
         header_view.setSectionResizeMode(6, QHeaderView.Fixed)
         header_view.setSectionResizeMode(7, QHeaderView.Fixed)
-        header_view.setSectionResizeMode(8, QHeaderView.Stretch)
+        header_view.setSectionResizeMode(8, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(9, QHeaderView.Stretch)
         self.queue_table.setColumnWidth(0, 40)
         self.queue_table.setColumnWidth(1, 100)
         self.queue_table.setColumnWidth(3, 120)
         self.queue_table.setColumnWidth(4, 80)
-        self.queue_table.setColumnWidth(5, 100)
+        self.queue_table.setColumnWidth(5, 80)
         self.queue_table.setColumnWidth(6, 80)
-        self.queue_table.setColumnWidth(7, 70)
+        self.queue_table.setColumnWidth(7, 80)
+        self.queue_table.setColumnWidth(8, 70)
         self.queue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.queue_table.verticalHeader().setVisible(False)
@@ -660,10 +725,13 @@ class MainWindow(QMainWindow):
             path_item = self.queue_table.item(row, 2)
             if path_item:
                 old_rows[path_item.text()] = {
-                    "step": self.queue_table.item(row, 5).text() if self.queue_table.item(row, 5) else "-",
-                    "after_count": self.queue_table.item(row, 6).text() if self.queue_table.item(row, 6) else "-",
-                    "status": self.queue_table.item(row, 7).text() if self.queue_table.item(row, 7) else "待完成",
-                    "log": self.queue_table.item(row, 8).text() if self.queue_table.item(row, 8) else "等待开始...",
+                    "essay_title": self.queue_table.item(row, 3).text() if self.queue_table.item(row, 3) else "-",
+                    "before_count": self.queue_table.item(row, 4).text() if self.queue_table.item(row, 4) else "-",
+                    "grade": self.queue_table.item(row, 5).text() if self.queue_table.item(row, 5) else "-",
+                    "online_offline": self.queue_table.item(row, 6).text() if self.queue_table.item(row, 6) else "-",
+                    "after_count": self.queue_table.item(row, 7).text() if self.queue_table.item(row, 7) else "-",
+                    "status": self.queue_table.item(row, 8).text() if self.queue_table.item(row, 8) else "待完成",
+                    "log": self.queue_table.item(row, 9).text() if self.queue_table.item(row, 9) else "等待开始...",
                 }
         status_colors = {"待完成": "#cfe2ff", "处理中": "#fff3bf", "已完成": "#d4edda", "失败": "#f8d7da"}
 
@@ -672,35 +740,41 @@ class MainWindow(QMainWindow):
             task_paths = list(self.task_queue)
         for i, task_path in enumerate(task_paths, start=1):
             folder_name = os.path.basename(task_path)
-            student, essay = infer_student_and_essay(folder_name)
-            count = count_existing_docx_chars(task_path)
+            student = folder_name
             row = self.queue_table.rowCount()
             self.queue_table.insertRow(row)
             self.queue_table.setItem(row, 0, QTableWidgetItem(str(i)))
             self.queue_table.setItem(row, 1, QTableWidgetItem(student))
             self.queue_table.setItem(row, 2, QTableWidgetItem(task_path))
-            self.queue_table.setItem(row, 3, QTableWidgetItem(essay))
-            self.queue_table.setItem(row, 4, QTableWidgetItem(count))
             if task_path in old_rows:
                 row_state = old_rows[task_path]
-                self.queue_table.setItem(row, 5, QTableWidgetItem(row_state["step"]))
-                self.queue_table.setItem(row, 6, QTableWidgetItem(row_state["after_count"]))
-                self.queue_table.setItem(row, 7, QTableWidgetItem(row_state["status"]))
-                self.queue_table.setItem(row, 8, QTableWidgetItem(row_state["log"]))
+                self.queue_table.setItem(row, 3, QTableWidgetItem(row_state["essay_title"]))
+                self.queue_table.setItem(row, 4, QTableWidgetItem(row_state["before_count"]))
+                self.queue_table.setItem(row, 5, QTableWidgetItem(row_state["grade"]))
+                self.queue_table.setItem(row, 6, QTableWidgetItem(row_state["online_offline"]))
+                self.queue_table.setItem(row, 7, QTableWidgetItem(row_state["after_count"]))
+                self.queue_table.setItem(row, 8, QTableWidgetItem(row_state["status"]))
+                self.queue_table.setItem(row, 9, QTableWidgetItem(row_state["log"]))
                 bg_color = QColor(status_colors.get(row_state["status"], "#ffffff"))
             elif task_path in self.completed_tasks:
-                self.queue_table.setItem(row, 5, QTableWidgetItem("完成"))
-                self.queue_table.setItem(row, 6, QTableWidgetItem("-"))
-                self.queue_table.setItem(row, 7, QTableWidgetItem("已完成"))
-                self.queue_table.setItem(row, 8, QTableWidgetItem("之前已处理完成，跳过"))
-                bg_color = QColor("#d4edda")
-            else:
+                self.queue_table.setItem(row, 3, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 4, QTableWidgetItem("-"))
                 self.queue_table.setItem(row, 5, QTableWidgetItem("-"))
                 self.queue_table.setItem(row, 6, QTableWidgetItem("-"))
-                self.queue_table.setItem(row, 7, QTableWidgetItem("待完成"))
-                self.queue_table.setItem(row, 8, QTableWidgetItem("等待开始..."))
+                self.queue_table.setItem(row, 7, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 8, QTableWidgetItem("已完成"))
+                self.queue_table.setItem(row, 9, QTableWidgetItem("之前已处理完成，跳过"))
+                bg_color = QColor("#d4edda")
+            else:
+                self.queue_table.setItem(row, 3, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 4, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 5, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 6, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 7, QTableWidgetItem("-"))
+                self.queue_table.setItem(row, 8, QTableWidgetItem("待完成"))
+                self.queue_table.setItem(row, 9, QTableWidgetItem("等待开始..."))
                 bg_color = QColor("#cfe2ff")
-            for col in range(9):
+            for col in range(10):
                 item = self.queue_table.item(row, col)
                 if item:
                     item.setBackground(bg_color)
@@ -761,7 +835,7 @@ class MainWindow(QMainWindow):
                     self.task_queue.append(task_path)
                 self.completed_tasks.discard(task_path)
                 self.finished_tasks.discard(task_path)
-            self.log_signal.task_status.emit(task_path, "pending", "等待重试", "", "手动重新加入队列")
+            self.log_signal.task_status.emit(task_path, "pending", "等待重试", "", "手动重新加入队列", "", "", "", "")
             requeued += 1
 
         if requeued:
@@ -788,27 +862,30 @@ class MainWindow(QMainWindow):
         self.log_signal.log_message.emit(f"已读取并加入 {added} 个任务" if added else "没有新任务")
         self._render_queue()
 
-    def _update_task_status(self, task_path: str, status: str, step: str = "", after_count: str = "", log_msg: str = ""):
-        """更新任务状态，支持实时步骤、修改后字数和日志"""
+    def _update_task_status(self, task_path: str, status: str, step: str = "", after_count: str = "", log_msg: str = "", grade: str = "", online_offline: str = "", before_count: str = "", essay_title: str = ""):
+        """更新任务状态"""
         labels = {"pending": "待完成", "running": "处理中", "done": "已完成", "failed": "失败"}
         colors = {"pending": "#cfe2ff", "running": "#fff3bf", "done": "#d4edda", "failed": "#f8d7da"}
         for row in range(self.queue_table.rowCount()):
             if self.queue_table.item(row, 2) and self.queue_table.item(row, 2).text() == task_path:
-                if step:
-                    self.queue_table.item(row, 5).setText(step)
+                # 实时日志：只显示最新的步骤或日志（替换）
+                display_msg = step if step else log_msg
+                if display_msg:
+                    self.queue_table.item(row, 9).setText(display_msg)
+                if essay_title:
+                    self.queue_table.item(row, 3).setText(essay_title)
+                if before_count:
+                    self.queue_table.item(row, 4).setText(before_count)
+                if grade:
+                    self.queue_table.item(row, 5).setText(grade)
+                if online_offline:
+                    self.queue_table.item(row, 6).setText(online_offline)
                 if after_count:
-                    self.queue_table.item(row, 6).setText(after_count)
+                    self.queue_table.item(row, 7).setText(after_count)
                 if status:
-                    self.queue_table.item(row, 7).setText(labels.get(status, status))
-                if log_msg:
-                    old_log = self.queue_table.item(row, 8).text()
-                    if old_log == "等待开始...":
-                        self.queue_table.item(row, 8).setText(log_msg)
-                    else:
-                        self.queue_table.item(row, 8).setText(old_log + "\n" + log_msg)
-                    self.queue_table.scrollToItem(self.queue_table.item(row, 8))
+                    self.queue_table.item(row, 8).setText(labels.get(status, status))
                 if status:
-                    for col in range(9):
+                    for col in range(10):
                         item = self.queue_table.item(row, col)
                         if item:
                             item.setBackground(QColor(colors.get(status, "#ffffff")))
@@ -856,7 +933,7 @@ class MainWindow(QMainWindow):
         if added:
             self.log_signal.log_message.emit(f"已自动读取 {added} 个任务")
         for task_path in requeued_tasks:
-            self.log_signal.task_status.emit(task_path, "pending", "等待重试", "", "重新加入队列")
+            self.log_signal.task_status.emit(task_path, "pending", "等待重试", "", "重新加入队列", "", "", "", "")
         self._refresh_queue()
 
         if not should_start_worker:
@@ -956,13 +1033,17 @@ class MainWindow(QMainWindow):
         if cfg.get("OCR", {}).get("BAIDU_CORRECTION", {}).get("ENABLED"):
             self.log_signal.log_message.emit("百度图片矫正：已启用")
 
-        def task_status_cb(folder_path, status, step="", log_msg="", after_count=""):
+        def task_status_cb(folder_path, status, step="", log_msg="", after_count="", grade="", online_offline="", before_count="", essay_title=""):
             self.log_signal.task_status.emit(
                 folder_path,
                 status,
                 step or "",
                 str(after_count) if after_count else "",
                 log_msg or "",
+                grade or "",
+                online_offline or "",
+                str(before_count) if before_count else "",
+                essay_title or "",
             )
 
         try:
@@ -974,10 +1055,10 @@ class MainWindow(QMainWindow):
 
                 def task_log(msg):
                     self.log_signal.log_message.emit(f"[{task_name}] {msg}")
-                    self.log_signal.task_status.emit(task_path, "", "", "", msg or "")
+                    self.log_signal.task_status.emit(task_path, "", "", "", msg or "", "", "", "", "")
 
                 try:
-                    self.log_signal.task_status.emit(task_path, "running", "排队启动", "", "开始处理")
+                    self.log_signal.task_status.emit(task_path, "running", "排队启动", "", "开始处理", "", "", "", "")
                     task_log(f"处理: {task_path}")
                     process_folder(
                         task_path,
@@ -987,7 +1068,7 @@ class MainWindow(QMainWindow):
                         task_status_callback=task_status_cb,
                     )
                 except Exception as exc:
-                    self.log_signal.task_status.emit(task_path, "failed", "", "", f"失败: {exc}")
+                    self.log_signal.task_status.emit(task_path, "failed", "", "", f"失败: {exc}", "", "", "", "")
                     self.log_signal.log_message.emit(f"[{task_name}] 处理失败：{exc}")
 
             started_any = False
@@ -1032,7 +1113,7 @@ class MainWindow(QMainWindow):
                         try:
                             future.result()
                         except Exception as exc:
-                            self.log_signal.task_status.emit(task_path, "failed", "", "", f"失败: {exc}")
+                            self.log_signal.task_status.emit(task_path, "failed", "", "", f"失败: {exc}", "", "", "", "")
                             self.log_signal.log_message.emit(f"[{os.path.basename(task_path)}] 处理失败：{exc}")
                         finally:
                             with self.queue_lock:
@@ -1157,6 +1238,34 @@ class MainWindow(QMainWindow):
         btn_start_ai.clicked.connect(self._start_ai_workflow)
         scroll_layout.addWidget(btn_start_ai)
 
+        # Task queue table (status only)
+        self.ai_queue_table = QTableWidget()
+        self.ai_queue_table.setColumnCount(9)
+        self.ai_queue_table.setHorizontalHeaderLabels(["序号", "学生姓名", "文件路径", "作文名称", "修改前字数", "当前步骤", "修改后字数", "状态", "实时日志"])
+        ai_header = self.ai_queue_table.horizontalHeader()
+        ai_header.setSectionResizeMode(0, QHeaderView.Fixed)
+        ai_header.setSectionResizeMode(1, QHeaderView.Fixed)
+        ai_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        ai_header.setSectionResizeMode(3, QHeaderView.Fixed)
+        ai_header.setSectionResizeMode(4, QHeaderView.Fixed)
+        ai_header.setSectionResizeMode(5, QHeaderView.Fixed)
+        ai_header.setSectionResizeMode(6, QHeaderView.Fixed)
+        ai_header.setSectionResizeMode(7, QHeaderView.Fixed)
+        ai_header.setSectionResizeMode(8, QHeaderView.Stretch)
+        self.ai_queue_table.setColumnWidth(0, 40)
+        self.ai_queue_table.setColumnWidth(1, 100)
+        self.ai_queue_table.setColumnWidth(3, 120)
+        self.ai_queue_table.setColumnWidth(4, 80)
+        self.ai_queue_table.setColumnWidth(5, 100)
+        self.ai_queue_table.setColumnWidth(6, 80)
+        self.ai_queue_table.setColumnWidth(7, 70)
+        self.ai_queue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.ai_queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.ai_queue_table.verticalHeader().setVisible(False)
+        self.ai_queue_table.setMinimumHeight(240)
+        self.ai_queue_table.setMaximumHeight(360)
+        scroll_layout.addWidget(self.ai_queue_table)
+
         # Log (collapsible)
         self.ai_log_section = CollapsibleSection("处理日志", collapsed=True)
         self.ai_log_text = QTextEdit()
@@ -1168,6 +1277,417 @@ class MainWindow(QMainWindow):
         scroll_layout.addStretch()
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
+
+    # ===================== PAGE 3: DOC AI 识别修改 =====================
+    def _init_page_doc_ai(self):
+        layout = QVBoxLayout(self.page_doc_ai)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        scroll_layout.setContentsMargins(4, 4, 4, 4)
+        scroll_layout.setSpacing(6)
+
+        # AI 配置
+        ai_group = QGroupBox("AI 配置")
+        ai_form = QFormLayout()
+
+        # Provider 选择
+        provider_layout = QHBoxLayout()
+        self.doc_ai_provider_combo = QComboBox()
+        names = _provider_name_list(self.config)
+        self.doc_ai_provider_combo.addItems(names)
+        self.doc_ai_provider_combo.currentTextChanged.connect(self._on_doc_ai_provider_change)
+        provider_layout.addWidget(self.doc_ai_provider_combo, 1)
+        ai_form.addRow("Provider:", provider_layout)
+
+        # API Key
+        self.doc_ai_key_entry = QLineEdit()
+        default_provider = _ensure_provider_exists(self.config, "deepseek")
+        default_cfg = (self.config.get("LLM", {}).get("PROVIDERS", {}).get(default_provider, {}) or {})
+        self.doc_ai_key_entry.setText(default_cfg.get("API_KEY", ""))
+        ai_form.addRow("API Key:", self.doc_ai_key_entry)
+
+        # Base URL
+        self.doc_ai_url_entry = QLineEdit()
+        self.doc_ai_url_entry.setText(default_cfg.get("BASE_URL", ""))
+        ai_form.addRow("Base URL:", self.doc_ai_url_entry)
+
+        # Model
+        self.doc_ai_model_entry = QLineEdit()
+        self.doc_ai_model_entry.setText(default_cfg.get("MODEL", "deepseek-chat"))
+        ai_form.addRow("Model:", self.doc_ai_model_entry)
+
+        # Prompt
+        ai_group.setLayout(ai_form)
+        scroll_layout.addWidget(ai_group)
+
+        # 文件夹路径
+        path_group = QGroupBox("文件夹路径")
+        path_layout = QHBoxLayout()
+        self.doc_ai_path_entry = QLineEdit()
+        self.doc_ai_path_entry.setPlaceholderText("选择包含docx文件的文件夹...")
+        btn_browse = QPushButton("浏览")
+        btn_browse.clicked.connect(self._browse_doc_ai_folder)
+        path_layout.addWidget(self.doc_ai_path_entry, 1)
+        path_layout.addWidget(btn_browse)
+        path_group.setLayout(path_layout)
+        scroll_layout.addWidget(path_group)
+
+        # 开始按钮
+        btn_start = QPushButton("开始识别")
+        btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-size: 14px; padding: 8px;")
+        btn_start.clicked.connect(self._start_doc_ai_workflow)
+        scroll_layout.addWidget(btn_start)
+
+        # 任务队列表格
+        self.doc_ai_queue_table = QTableWidget()
+        self.doc_ai_queue_table.setColumnCount(10)
+        self.doc_ai_queue_table.setHorizontalHeaderLabels([
+            "序号", "文件路径", "作文标题", "作者", "原文字数", "修改后字数", "年级", "线上线下", "是否合格", "状态"
+        ])
+        header = self.doc_ai_queue_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.setSectionResizeMode(7, QHeaderView.Fixed)
+        header.setSectionResizeMode(8, QHeaderView.Fixed)
+        header.setSectionResizeMode(9, QHeaderView.Fixed)
+        self.doc_ai_queue_table.setColumnWidth(0, 40)
+        self.doc_ai_queue_table.setColumnWidth(2, 150)
+        self.doc_ai_queue_table.setColumnWidth(3, 80)
+        self.doc_ai_queue_table.setColumnWidth(4, 80)
+        self.doc_ai_queue_table.setColumnWidth(5, 80)
+        self.doc_ai_queue_table.setColumnWidth(6, 60)
+        self.doc_ai_queue_table.setColumnWidth(7, 60)
+        self.doc_ai_queue_table.setColumnWidth(8, 70)
+        self.doc_ai_queue_table.setColumnWidth(9, 80)
+        self.doc_ai_queue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.doc_ai_queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.doc_ai_queue_table.verticalHeader().setVisible(False)
+        self.doc_ai_queue_table.setMinimumHeight(240)
+        self.doc_ai_queue_table.setMaximumHeight(400)
+        scroll_layout.addWidget(self.doc_ai_queue_table)
+
+        # 日志区域
+        self.doc_ai_log_section = CollapsibleSection("处理日志", collapsed=True)
+        self.doc_ai_log_text = QTextEdit()
+        self.doc_ai_log_text.setReadOnly(True)
+        self.doc_ai_log_text.setMaximumHeight(200)
+        self.doc_ai_log_section.add_widget(self.doc_ai_log_text)
+        scroll_layout.addWidget(self.doc_ai_log_section)
+
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+
+    def _on_doc_ai_provider_change(self, name):
+        p_name = _ensure_provider_exists(self.config, name)
+        provider_cfg = (self.config.get("LLM", {}).get("PROVIDERS", {}).get(p_name, {}) or {})
+        self.doc_ai_key_entry.setText(provider_cfg.get("API_KEY", ""))
+        self.doc_ai_url_entry.setText(provider_cfg.get("BASE_URL", ""))
+        self.doc_ai_model_entry.setText(provider_cfg.get("MODEL", ""))
+
+    def _browse_doc_ai_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择文件夹")
+        if folder:
+            self.doc_ai_path_entry.setText(folder)
+
+    def _scan_docx_files(self, folder):
+        """递归扫描文件夹中的docx文件，排除'修改后'文件夹"""
+        docx_files = []
+        for root, dirs, files in os.walk(folder):
+            # 排除"修改后"文件夹
+            dirs[:] = [d for d in dirs if d != "修改后"]
+            for file in files:
+                if file.lower().endswith(".docx") and not file.startswith("~$"):
+                    docx_files.append(os.path.join(root, file))
+        return docx_files
+
+    def _start_doc_ai_workflow(self):
+        threading.Thread(target=self._run_doc_ai_workflow, daemon=True).start()
+
+    def _run_doc_ai_workflow(self):
+        folder = self.doc_ai_path_entry.text().strip()
+        api_key = self.doc_ai_key_entry.text().strip()
+        base_url = self.doc_ai_url_entry.text().strip()
+        model = self.doc_ai_model_entry.text().strip() or "deepseek-chat"
+
+        if not folder or not api_key:
+            self.log_signal.doc_ai_log_message.emit("请填写文件夹路径和 API Key")
+            return
+        if not os.path.isdir(folder):
+            self.log_signal.doc_ai_log_message.emit("文件夹路径无效")
+            return
+
+        # 保存配置
+        selected_provider = _ensure_provider_exists(self.config, self.doc_ai_provider_combo.currentText() or "deepseek")
+        cfg = self.config
+        cfg.setdefault("LLM", {})
+        cfg["LLM"].setdefault("PROVIDERS", {})
+        cfg["LLM"]["PROVIDERS"].setdefault(selected_provider, {})
+        cfg["LLM"]["PROVIDERS"][selected_provider]["API_KEY"] = api_key
+        cfg["LLM"]["PROVIDERS"][selected_provider]["BASE_URL"] = base_url
+        cfg["LLM"]["PROVIDERS"][selected_provider]["MODEL"] = model
+        save_config(cfg)
+
+        # 扫描docx文件
+        self.log_signal.doc_ai_log_message.emit("开始扫描文件夹...")
+        docx_files = self._scan_docx_files(folder)
+
+        if not docx_files:
+            self.log_signal.doc_ai_log_message.emit("未找到docx文件")
+            return
+
+        self.log_signal.doc_ai_log_message.emit(f"找到 {len(docx_files)} 个docx文件")
+        self.log_signal.doc_ai_tasks_loaded.emit(docx_files)
+
+        # 创建AI客户端
+        try:
+            client = OpenAI(api_key=api_key, base_url=base_url)
+        except Exception as e:
+            self.log_signal.doc_ai_log_message.emit(f"创建AI客户端失败: {e}")
+            return
+
+        # AI识别提示词
+        prompt_template = """请分析以下文档内容，识别并提取以下信息：
+1. 作文标题：从文章中识别的标题，去掉"题目"、"标题"等前缀
+2. 作者：从文章中识别的作者姓名，去掉"——"前缀
+3. 原文字数：文章原始字数（包含标点，不含空格）
+4. 修改后字数：文章修改后字数（包含标点，不含空格）
+5. 年级：从文章中识别的年级，如：三年级、四年级等，如无法识别则填"未知"
+6. 线上或线下：从文章中识别的线上或线下，如无法识别则填"未知"
+
+文档路径：{file_path}
+
+文档内容：
+{text}
+
+请以JSON格式返回，格式如下：
+{{
+  "作文标题": "识别的标题",
+  "作者": "识别的作者",
+  "原文字数": "原始字数",
+  "修改后字数": "修改后字数",
+  "年级": "识别的年级",
+  "线上或线下": "识别的线上或线下"
+}}"""
+
+        # 处理每个文件
+        for i, docx_path in enumerate(docx_files, 1):
+            self.log_signal.doc_ai_log_message.emit(f"处理第 {i}/{len(docx_files)} 个文件: {os.path.basename(docx_path)}")
+            self.log_signal.doc_ai_task_status.emit(docx_path, "处理中", "正在读取文件...")
+
+            try:
+                # 读取docx内容
+                doc = Document(docx_path)
+                full_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+
+                if not full_text.strip():
+                    self.log_signal.doc_ai_log_message.emit(f"  {os.path.basename(docx_path)}: 空文档，跳过")
+                    self.log_signal.doc_ai_task_status.emit(docx_path, "跳过", "空文档")
+                    continue
+
+                # 构造prompt
+                prompt = prompt_template.format(
+                    file_path=docx_path,
+                    text=full_text
+                )
+
+                # 调用AI
+                self.log_signal.doc_ai_task_status.emit(docx_path, "处理中", "正在调用AI...")
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "你是一名专业的文档分析助手，擅长从中文作文中提取信息。"},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    stream=False
+                )
+
+                result_text = response.choices[0].message.content.strip()
+
+                # 解析JSON
+                try:
+                    # 提取JSON内容（可能被```json```包裹）
+                    json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
+                    if json_match:
+                        json_str = json_match.group(1)
+                    else:
+                        json_str = result_text
+
+                    result_data = json.loads(json_str)
+
+                    # 更新表格
+                    title = result_data.get("作文标题", "未知")
+                    author = result_data.get("作者", "未知")
+                    original_count = result_data.get("原文字数", "未知")
+                    modified_count = result_data.get("修改后字数", "未知")
+                    grade = result_data.get("年级", "未知")
+                    online_offline = result_data.get("线上或线下", "未知")
+
+                    # 判断修改后字数是否合格（780-930字）
+                    is_qualified = "未知"
+                    try:
+                        modified_count_int = int(modified_count)
+                        if 780 <= modified_count_int <= 930:
+                            is_qualified = "合格"
+                        else:
+                            is_qualified = "不合格"
+                    except (ValueError, TypeError):
+                        is_qualified = "未知"
+
+                    self.log_signal.doc_ai_task_status.emit(
+                        docx_path, "完成",
+                        f"标题:{title} 作者:{author} 字数:{original_count} 年级:{grade} 修改后:{modified_count}字 [{is_qualified}]"
+                    )
+
+                    # 更新表格显示
+                    QTimer.singleShot(0, lambda p=docx_path, t=title, a=author, 
+                                     oc=original_count, mc=modified_count, 
+                                     g=grade, oo=online_offline, iq=is_qualified: 
+                                     self._update_doc_ai_table(p, t, a, oc, mc, g, oo, iq))
+
+                except json.JSONDecodeError as e:
+                    self.log_signal.doc_ai_log_message.emit(f"  {os.path.basename(docx_path)}: JSON解析失败 - {e}")
+                    self.log_signal.doc_ai_task_status.emit(docx_path, "失败", f"JSON解析失败: {e}")
+
+            except Exception as e:
+                self.log_signal.doc_ai_log_message.emit(f"  {os.path.basename(docx_path)}: {e}")
+                self.log_signal.doc_ai_task_status.emit(docx_path, "失败", str(e))
+                if _is_bad_marshal_error(e):
+                    _clear_project_bytecode_caches()
+                    self.log_signal.doc_ai_log_message.emit(_format_exception_for_log(e))
+
+        self.log_signal.doc_ai_log_message.emit("处理完成！")
+
+    def _update_doc_ai_table(self, file_path, title, author, original_count, modified_count, grade, online_offline, is_qualified):
+        """更新表格中指定文件的信息"""
+        for row in range(self.doc_ai_queue_table.rowCount()):
+            path_item = self.doc_ai_queue_table.item(row, 1)
+            if path_item and path_item.text() == file_path:
+                self.doc_ai_queue_table.setItem(row, 2, QTableWidgetItem(title))
+                self.doc_ai_queue_table.setItem(row, 3, QTableWidgetItem(author))
+                self.doc_ai_queue_table.setItem(row, 4, QTableWidgetItem(str(original_count)))
+                self.doc_ai_queue_table.setItem(row, 5, QTableWidgetItem(str(modified_count)))
+                self.doc_ai_queue_table.setItem(row, 6, QTableWidgetItem(grade))
+                self.doc_ai_queue_table.setItem(row, 7, QTableWidgetItem(online_offline))
+                # 设置"是否合格"列，合格显示绿色，不合格显示红色
+                qualified_item = QTableWidgetItem(is_qualified)
+                if is_qualified == "合格":
+                    qualified_item.setBackground(QColor("#d4edda"))  # 浅绿色
+                elif is_qualified == "不合格":
+                    qualified_item.setBackground(QColor("#f8d7da"))  # 浅红色
+                self.doc_ai_queue_table.setItem(row, 8, qualified_item)
+                break
+
+    def _render_doc_ai_queue(self, task_paths):
+        self.doc_ai_queue_table.setRowCount(0)
+        for i, task_path in enumerate(task_paths, start=1):
+            row = self.doc_ai_queue_table.rowCount()
+            self.doc_ai_queue_table.insertRow(row)
+            self.doc_ai_queue_table.setItem(row, 0, QTableWidgetItem(str(i)))
+            self.doc_ai_queue_table.setItem(row, 1, QTableWidgetItem(task_path))
+            self.doc_ai_queue_table.setItem(row, 2, QTableWidgetItem("-"))
+            self.doc_ai_queue_table.setItem(row, 3, QTableWidgetItem("-"))
+            self.doc_ai_queue_table.setItem(row, 4, QTableWidgetItem("-"))
+            self.doc_ai_queue_table.setItem(row, 5, QTableWidgetItem("-"))
+            self.doc_ai_queue_table.setItem(row, 6, QTableWidgetItem("-"))
+            self.doc_ai_queue_table.setItem(row, 7, QTableWidgetItem("-"))
+            self.doc_ai_queue_table.setItem(row, 8, QTableWidgetItem("-"))
+            self.doc_ai_queue_table.setItem(row, 9, QTableWidgetItem("待处理"))
+            for col in range(10):
+                item = self.doc_ai_queue_table.item(row, col)
+                if item:
+                    item.setBackground(QColor("#cfe2ff"))
+
+    def _update_doc_ai_task_status(self, task_path, status, log_msg=""):
+        colors = {"待处理": "#cfe2ff", "处理中": "#fff3bf", "完成": "#d4edda", "失败": "#f8d7da", "跳过": "#e2e3e5"}
+        for row in range(self.doc_ai_queue_table.rowCount()):
+            path_item = self.doc_ai_queue_table.item(row, 1)
+            if path_item and path_item.text() == task_path:
+                self.doc_ai_queue_table.setItem(row, 9, QTableWidgetItem(status))
+                bg = QColor(colors.get(status, "#ffffff"))
+                for col in range(10):
+                    item = self.doc_ai_queue_table.item(row, col)
+                    if item:
+                        item.setBackground(bg)
+                break
+
+    def _count_docx_file_chars(self, docx_path: str) -> str:
+        try:
+            if os.path.isfile(docx_path) and docx_path.lower().endswith(".docx"):
+                doc = Document(docx_path)
+                total = sum(len(p.text.strip()) for p in doc.paragraphs if p.text.strip())
+                return str(total)
+        except Exception:
+            pass
+        return ""
+
+    def _ai_output_docx_path(self, task_path: str) -> str:
+        root, ext = os.path.splitext(task_path)
+        if ext.lower() == ".docx":
+            return task_path
+        converted = root + ".docx"
+        return converted if os.path.isfile(converted) else task_path
+
+    def _render_ai_queue(self, task_paths):
+        self.ai_queue_table.setRowCount(0)
+        for i, task_path in enumerate(task_paths, start=1):
+            base = os.path.basename(task_path)
+            display_name = base[2:] if base.startswith("改 ") else base
+            stem, ext = os.path.splitext(display_name)
+            student, essay = infer_student_and_essay(stem)
+            before_count = self._count_docx_file_chars(task_path)
+            row = self.ai_queue_table.rowCount()
+            self.ai_queue_table.insertRow(row)
+            self.ai_queue_table.setItem(row, 0, QTableWidgetItem(str(i)))
+            self.ai_queue_table.setItem(row, 1, QTableWidgetItem(student))
+            self.ai_queue_table.setItem(row, 2, QTableWidgetItem(task_path))
+            self.ai_queue_table.setItem(row, 3, QTableWidgetItem(essay))
+            self.ai_queue_table.setItem(row, 4, QTableWidgetItem(before_count))
+            self.ai_queue_table.setItem(row, 5, QTableWidgetItem("-"))
+            self.ai_queue_table.setItem(row, 6, QTableWidgetItem("-"))
+            self.ai_queue_table.setItem(row, 7, QTableWidgetItem("待完成"))
+            self.ai_queue_table.setItem(row, 8, QTableWidgetItem("等待开始..."))
+            for col in range(9):
+                item = self.ai_queue_table.item(row, col)
+                if item:
+                    item.setBackground(QColor("#cfe2ff"))
+
+    def _update_ai_task_status(self, task_path: str, status: str, step: str = "", after_count: str = "", log_msg: str = ""):
+        labels = {"pending": "待完成", "running": "处理中", "done": "已完成", "failed": "失败"}
+        colors = {"pending": "#cfe2ff", "running": "#fff3bf", "done": "#d4edda", "failed": "#f8d7da"}
+        for row in range(self.ai_queue_table.rowCount()):
+            path_item = self.ai_queue_table.item(row, 2)
+            if path_item and path_item.text() == task_path:
+                if step:
+                    self.ai_queue_table.item(row, 5).setText(step)
+                if after_count:
+                    self.ai_queue_table.item(row, 6).setText(after_count)
+                if status:
+                    self.ai_queue_table.item(row, 7).setText(labels.get(status, status))
+                if log_msg:
+                    old_log = self.ai_queue_table.item(row, 8).text()
+                    if old_log == "等待开始...":
+                        self.ai_queue_table.item(row, 8).setText(log_msg)
+                    else:
+                        self.ai_queue_table.item(row, 8).setText(old_log + "\n" + log_msg)
+                    self.ai_queue_table.scrollToItem(self.ai_queue_table.item(row, 8))
+                if status:
+                    bg = QColor(colors.get(status, "#ffffff"))
+                    for col in range(9):
+                        item = self.ai_queue_table.item(row, col)
+                        if item:
+                            item.setBackground(bg)
+                break
 
     def _browse_ai_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "选择处理文件夹")
@@ -1184,6 +1704,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._run_ai_workflow, daemon=True).start()
 
     def _run_ai_workflow(self):
+        _clear_project_bytecode_caches()
         folder = self.ai_path_entry.text().strip()
         selected_provider = _ensure_provider_exists(self.config, self.ai_provider_combo.currentText() or "deepseek")
         api_key = self.ai_key_entry.text().strip()
@@ -1207,10 +1728,10 @@ class MainWindow(QMainWindow):
                 return
 
         if not folder or not api_key:
-            self._append_log_ai("请填写文件夹路径和 API Key")
+            self.log_signal.ai_log_message.emit("请填写文件夹路径和 API Key")
             return
         if not os.path.isdir(folder):
-            self._append_log_ai("文件夹路径无效")
+            self.log_signal.ai_log_message.emit("文件夹路径无效")
             return
 
         cfg = self.config
@@ -1229,10 +1750,11 @@ class MainWindow(QMainWindow):
         cfg["LLM"]["TASKS"]["editor"]["COUNT_MAX"] = count_max
         save_config(cfg)
 
-        self._append_log_ai("开始处理流程...")
-        self._append_log_ai("【准备】复制原始文件...")
+        self.log_signal.ai_log_message.emit("开始处理流程...")
+        self.log_signal.ai_tasks_loaded.emit([])
+        self.log_signal.ai_log_message.emit("【准备】复制原始文件...")
         import shutil
-        copied_files = []
+        copied_paths = []
         image_exts = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
         for root, files in iter_files_limited(folder, max_depth=4):
             for file in files:
@@ -1244,29 +1766,31 @@ class MainWindow(QMainWindow):
                     new_path = os.path.join(root, new_filename)
                     try:
                         shutil.copy2(original_path, new_path)
-                        copied_files.append(new_filename)
-                        self._append_log_ai(f"  {new_filename}")
+                        copied_paths.append(new_path)
+                        self.log_signal.ai_log_message.emit(f"  {new_filename}")
                     except Exception as e:
-                        self._append_log_ai(f"  {file} 复制失败: {e}")
+                        self.log_signal.ai_log_message.emit(f"  {file} 复制失败: {e}")
 
-        if not copied_files:
-            self._append_log_ai("未找到需要处理的文件")
+        if not copied_paths:
+            self.log_signal.ai_tasks_loaded.emit([])
+            self.log_signal.ai_log_message.emit("未找到需要处理的文件")
             return
+
+        self.log_signal.ai_tasks_loaded.emit(copied_paths)
 
         enabled_tasks = sorted([(t["id"], t["order"]) for t in self.task_config if t["enabled"]], key=lambda x: x[1])
         task_step_names = {"6": "DOC转DOCX", "1": "清除空格", "AI": "AI改作文", "2": "添加标签", "3": "格式化", "5": "改作者"}
 
         def update_step(task_path, step_name):
-            QTimer.singleShot(0, lambda p=task_path, s=step_name: self._update_task_status(p, "running", step=step_name))
+            self.log_signal.ai_task_status.emit(task_path, "running", step_name, "", f"开始：{step_name}")
 
         try:
             for task_id, _ in enabled_tasks:
                 step_name = task_step_names.get(task_id, task_id)
-                self._append_log_ai(f"【{step_name}】开始...")
+                self.log_signal.ai_log_message.emit(f"【{step_name}】开始...")
                 # 更新所有任务的当前步骤
-                for tp in copied_files:
-                    folder_of_file = os.path.join(folder, os.path.dirname(tp))
-                    update_step(folder_of_file, step_name)
+                for task_path in copied_paths:
+                    update_step(task_path, step_name)
 
                 if task_id == "6":
                     self._convert_docs(folder)
@@ -1282,17 +1806,17 @@ class MainWindow(QMainWindow):
                     self._set_author(folder)
 
             # 更新完成状态和修改后字数
-            for root_dir, files in iter_files_limited(folder, max_depth=4):
-                for file in files:
-                    if file.startswith("改 ") and file.endswith(".docx"):
-                        full_path = os.path.join(root_dir, file)
-                        after_count = count_existing_docx_chars(os.path.dirname(full_path))
-                        QTimer.singleShot(0, lambda p=full_path, c=after_count: self._update_task_status(p, "done", step="完成", after_count=c))
+            for task_path in copied_paths:
+                output_path = self._ai_output_docx_path(task_path)
+                after_count = self._count_docx_file_chars(output_path)
+                self.log_signal.ai_task_status.emit(task_path, "done", "完成", after_count, "处理完成")
 
-            self._append_log_ai("所有流程完成！")
+            self.log_signal.ai_log_message.emit("所有流程完成！")
         except Exception as e:
-            self._append_log_ai(f"处理失败：{e}")
-            import traceback
+            for task_path in copied_paths:
+                self.log_signal.ai_task_status.emit(task_path, "failed", "", "", f"失败: {e}")
+            self.log_signal.ai_log_message.emit(f"处理失败：{e}")
+            self.log_signal.ai_log_message.emit(_format_exception_for_log(e))
             traceback.print_exc()
 
     def _convert_docs(self, folder):
@@ -1308,9 +1832,9 @@ class MainWindow(QMainWindow):
                         new_path = os.path.join(root, base_name + ".docx")
                         if os.path.exists(new_path):
                             os.remove(doc_path)
-                            self._append_log_ai(f"  {base_name}")
+                            self.log_signal.ai_log_message.emit(f"  {base_name}")
                     except Exception as e:
-                        self._append_log_ai(f"  {file}: {e}")
+                        self.log_signal.ai_log_message.emit(f"  {file}: {e}")
 
     def _clear_spaces(self, folder):
         for root, files in iter_files_limited(folder, max_depth=4):
@@ -1324,9 +1848,9 @@ class MainWindow(QMainWindow):
                             for run in para.runs:
                                 run.text = run.text.strip()
                         doc.save(os.path.join(root, file))
-                        self._append_log_ai(f"  {file}")
+                        self.log_signal.ai_log_message.emit(f"  {file}")
                     except Exception as e:
-                        self._append_log_ai(f"  {file}: {e}")
+                        self.log_signal.ai_log_message.emit(f"  {file}: {e}")
 
     def _process_ai(self, folder, api_key, base_url, prompt_template, count_min=None, count_max=None):
         if not prompt_template:
@@ -1344,7 +1868,7 @@ class MainWindow(QMainWindow):
                     doc = Document(doc_path)
                     all_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip() and p.text.strip() not in ("修改前：", "修改后：")])
                     if not all_text.strip():
-                        self._append_log_ai(f"  {file} (空文档)")
+                        self.log_signal.ai_log_message.emit(f"  {file} (空文档)")
                         continue
 
                     original_count = count_chinese_characters(all_text)
@@ -1362,14 +1886,14 @@ class MainWindow(QMainWindow):
                         if attempt > 1:
                             current_prompt += f"\n\n字数不符合规则，请重新修改并返回修改后的正文。只输出正文，不要解释。这次要求字数在 {count_min} 到 {count_max} 之间。"
 
-                        self._append_log_ai(f"  {file} AI 第{attempt}次输出，正在检查字数...")
+                        self.log_signal.ai_log_message.emit(f"  {file} AI 第{attempt}次输出，正在检查字数...")
                         response = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "system", "content": "你是一名严谨的中文校对助手"}, {"role": "user", "content": current_prompt}], temperature=0.1, stream=False)
                         result_text = response.choices[0].message.content.strip()
                         current_count = count_chinese_characters(result_text)
                         if count_min <= current_count <= count_max:
-                            self._append_log_ai(f"  {file} 字数符合：{current_count}（目标 {count_min}-{count_max}）")
+                            self.log_signal.ai_log_message.emit(f"  {file} 字数符合：{current_count}（目标 {count_min}-{count_max}）")
                             break
-                        self._append_log_ai(f"  {file} 字数不合规：{current_count}，目标 {count_min}-{count_max}，正在重试...")
+                        self.log_signal.ai_log_message.emit(f"  {file} 字数不合规：{current_count}，目标 {count_min}-{count_max}，正在重试...")
                     else:
                         raise RuntimeError(f"{file} AI 输出字数不符合要求")
 
@@ -1392,9 +1916,12 @@ class MainWindow(QMainWindow):
                             p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
                             p.paragraph_format.line_spacing = Pt(12)
                     doc.save(doc_path)
-                    self._append_log_ai(f"  {file}")
+                    self.log_signal.ai_log_message.emit(f"  {file}")
                 except Exception as e:
-                    self._append_log_ai(f"  {file}: {e}")
+                    self.log_signal.ai_log_message.emit(f"  {file}: {e}")
+                    if _is_bad_marshal_error(e):
+                        _clear_project_bytecode_caches()
+                        self.log_signal.ai_log_message.emit(_format_exception_for_log(e))
 
     def _add_labels(self, folder):
         for root, files in iter_files_limited(folder, max_depth=4):
@@ -1420,9 +1947,9 @@ class MainWindow(QMainWindow):
                             para.paragraph_format.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
                             para.paragraph_format.line_spacing = Pt(12)
                     doc.save(doc_path)
-                    self._append_log_ai(f"  {file}")
+                    self.log_signal.ai_log_message.emit(f"  {file}")
                 except Exception as e:
-                    self._append_log_ai(f"  {file}: {e}")
+                    self.log_signal.ai_log_message.emit(f"  {file}: {e}")
 
     def _format_docs(self, folder):
         for root, files in iter_files_limited(folder, max_depth=4):
@@ -1443,9 +1970,9 @@ class MainWindow(QMainWindow):
                         para.paragraph_format.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
                         para.paragraph_format.line_spacing = Pt(12)
                     doc.save(doc_path)
-                    self._append_log_ai(f"  {file}")
+                    self.log_signal.ai_log_message.emit(f"  {file}")
                 except Exception as e:
-                    self._append_log_ai(f"  {file}: {e}")
+                    self.log_signal.ai_log_message.emit(f"  {file}: {e}")
 
     def _set_author(self, folder):
         for root, files in iter_files_limited(folder, max_depth=4):
@@ -1457,15 +1984,27 @@ class MainWindow(QMainWindow):
                     doc = Document(doc_path)
                     doc.core_properties.author = "思睿教育_美丽可爱的尹老师"
                     doc.save(doc_path)
-                    self._append_log_ai(f"  {file}")
+                    self.log_signal.ai_log_message.emit(f"  {file}")
                 except Exception as e:
-                    self._append_log_ai(f"  {file}: {e}")
+                    self.log_signal.ai_log_message.emit(f"  {file}: {e}")
 
 
 # ===================== Main =====================
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    try:
+        _write_startup_log("main: start")
+        app = QApplication(sys.argv)
+        _write_startup_log("main: QApplication created")
+        app.setStyle("Fusion")
+        window = MainWindow()
+        _write_startup_log("main: MainWindow created")
+        window.show()
+        _write_startup_log(f"main: window shown visible={window.isVisible()}")
+        exit_code = app.exec()
+        _write_startup_log(f"main: app.exec returned {exit_code}")
+        sys.exit(exit_code)
+    except Exception:
+        _write_crash_log(*sys.exc_info())
+        raise
+
+

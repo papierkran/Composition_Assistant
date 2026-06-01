@@ -1,0 +1,5 @@
+[2026-06-02 04:43:37] main: start
+[2026-06-02 04:43:37] main: QApplication created
+[2026-06-02 04:43:37] main: MainWindow created
+[2026-06-02 04:43:37] main: window shown visible=True
+[2026-06-02 04:43:42] main: app.exec returned 0

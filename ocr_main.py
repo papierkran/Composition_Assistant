@@ -75,15 +75,44 @@ if not all([URL, APPID, API_KEY]):
 # ========== LLM（OpenAI-compatible）任务配置 =================================================
 # 兼容：通过 ensure_new_schema 已把旧配置映射到 LLM.PROVIDERS + LLM.TASKS
 DEFAULT_TYPO_FIX_PROMPT = (
-    "下面是一篇中文文章，请你【只修改错别字和明显的识别错误】。\n"
+    "下面是一篇中文文章，请你完成以下任务：\n"
+    "1. 【只修改错别字和明显的识别错误】\n"
+    "2. 【从文章中识别并提取元数据信息】\n\n"
     "要求：\n"
     "1. 不改变原意\n"
     "2. 不润色文风\n"
     "3. 不增删内容\n"
+    "4. 保持原有段落结构\n\n"
+    "请严格按照以下JSON格式输出（不要输出其他内容）：\n"
+    "```json\n"
+    "{\n"
+    '  "作文标题": "从文章中识别的标题，去掉题目、标题等前缀",\n'
+    '  "作者": "从文章中识别的作者姓名，去掉——前缀",\n'
+    '  "原文字数": "文章原始字数（包含标点，不含空格）",\n'
+    '  "年级": "从文章中识别的年级，如：三年级、四年级等，如无法识别则填未知",\n'
+    '  "线上或线下": "从文章中识别的线上或线下，如无法识别则填未知",\n'
+    '  "修改后内容": "作文标题（换行）——作者姓名（换行）修正错别字后的完整文章内容"\n'
+    "}\n"
+    "```\n\n"
+    "注意：\n"
+    "- 字数用代码统计（非估算），包含标点符号，不包含空格\n"
+    "- 如果无法识别某个字段，请填写未知\n"
+    "- 标题不要出现 题目： 标题：等字样\n"
+    "- 修改后内容的第一行是作文标题，第二行是——作者姓名，然后是文章正文\n\n"
+    "文章内容如下：\n"
+    "{text}"
+)
+
+DEFAULT_EDITOR_PROMPT = (
+    "下面是一篇中文文章，请你【对文章进行改写】。\n"
+    "要求：\n"
+    "1. 可以改变原意，但要保持文章主题不变\n"
+    "2. 可以润色文风\n"
+    "3. 可以增删内容，但要保持文章结构合理\n"
     "4. 保持原有段落结构\n"
     "5. 只输出修改后的完整文章正文\n"
     "6. 格式应该是  标题  （\\n）下一行  ——xx(替换为姓名)  然后文章内容\n"
-    "标题不要出现 ‘题目：’ ‘标题：’等字样\n\n"
+    "标题不要出现 题目： 标题：等字样\n\n"
     "{text}"
 )
 # ==================================================================
@@ -171,11 +200,13 @@ def main(argv=None):
 
 # LLM（OpenAI-compatible）相关设置
 
-def llm_fix_typos(prompt_template: str, text: str, client: OpenAI, model: str) -> str:
+def llm_fix_typos(prompt_template: str, text: str, client: OpenAI, model: str) -> dict:
     """调用 OpenAI-compatible LLM，只修改错别字，不改变原意，不润色。
 
     `prompt_template` 可以包含 `{text}` 占位符；如果没有，会把 `text` 追加到末尾。
     是否打印 prompt/response 由 DEBUG 控制。
+    
+    返回：包含元数据和修改后内容的字典
     """
     if not prompt_template:
         prompt_template = DEFAULT_TYPO_FIX_PROMPT
@@ -214,11 +245,42 @@ def llm_fix_typos(prompt_template: str, text: str, client: OpenAI, model: str) -
     result_text = response.choices[0].message.content.strip()
 
     if DEBUG:
-        print("\n=================【LLM 修改后的正文】=================\n")
+        print("\n=================【LLM 返回的原始内容】=================\n")
         print(result_text)
         print("\n=====================================================\n")
 
-    return result_text
+    # 解析JSON格式的返回内容
+    try:
+        # 提取JSON内容（可能被```json```包裹）
+        import re
+        json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            # 尝试直接解析
+            json_str = result_text
+        
+        result_data = json.loads(json_str)
+        
+        # 验证必需字段
+        required_fields = ["作文标题", "作者", "原文字数", "年级", "线上或线下", "修改后内容"]
+        for field in required_fields:
+            if field not in result_data:
+                result_data[field] = "未知"
+        
+        return result_data
+        
+    except json.JSONDecodeError as e:
+        _LOGGER.warning(f"解析LLM返回的JSON失败：{e}，使用原始文本作为修改后内容")
+        # JSON解析失败，返回默认格式
+        return {
+            "作文标题": "未知",
+            "作者": "未知",
+            "原文字数": str(count_chinese_characters(text)),
+            "年级": "未知",
+            "线上或线下": "未知",
+            "修改后内容": result_text
+        }
 
 
 def count_chinese_characters(text: str) -> int:
@@ -245,7 +307,7 @@ def is_word_count_within_rules(text: str, original_count: int) -> bool:
 def llm_edit_with_word_count_supervision(prompt_template: str, full_text: str, client: OpenAI, model: str, original_count: int, count_min=None, count_max=None, log_callback=None) -> str:
     """Send editor prompt to LLM and retry until word count rules are satisfied."""
     if not prompt_template:
-        prompt_template = DEFAULT_TYPO_FIX_PROMPT
+        prompt_template = DEFAULT_EDITOR_PROMPT
 
     if count_min is None or count_max is None:
         default_min, default_max = determine_word_count_bounds(original_count)
@@ -505,7 +567,7 @@ def process_folder(folder_path: str,
                 if task_status_callback:
                     task_status_callback(folder_path, "running", step="AI错别字修正", log_msg="正在调用AI修正...")
                 try:
-                    fix_docx_with_llm(doc_path, task_name="typo_fix")
+                    fix_docx_with_llm(doc_path, task_name="typo_fix", log_callback=log_callback, task_status_callback=task_status_callback)
                     log_callback("✅ LLM 纠错完成")
                     if task_status_callback:
                         task_status_callback(folder_path, "running", step="AI错别字修正", log_msg="AI修正完成")
@@ -518,10 +580,10 @@ def process_folder(folder_path: str,
                 if task_status_callback:
                     task_status_callback(folder_path, "running", step="AI作文改写", log_msg="正在改写作文...")
                 try:
-                    edit_docx_with_llm(doc_path, task_name="editor", log_callback=log_callback)
+                    new_count = edit_docx_with_llm(doc_path, task_name="editor", log_callback=log_callback)
                     log_callback("✅ 第二步改写完成")
                     if task_status_callback:
-                        task_status_callback(folder_path, "running", step="AI作文改写", log_msg="作文改写完成")
+                        task_status_callback(folder_path, "running", step="AI作文改写", log_msg="作文改写完成", after_count=str(new_count) if new_count else "")
                 except Exception as e:
                     log_callback(f"⚠️ 第二步改写失败：{e}")
 
@@ -543,7 +605,7 @@ def process_folder(folder_path: str,
         if use_typo_fix:
             log_callback("🤖 正在调用 LLM 进行错别字纠正...")
             try:
-                fix_docx_with_llm(doc_path, task_name="typo_fix")
+                fix_docx_with_llm(doc_path, task_name="typo_fix", log_callback=log_callback, task_status_callback=task_status_callback)
                 log_callback("✅ LLM 纠错完成")
             except Exception as e:
                 log_callback(f"⚠️ LLM 纠错失败：{e}")
@@ -646,13 +708,18 @@ def insert_before_text(doc: Document, new_paragraphs):
 
         new_p = doc.add_paragraph(para)
 
-        # 设置格式：首行缩进、行距等
+        # 设置格式：行距等
         fmt = new_p.paragraph_format
-        fmt.first_line_indent = Cm(0.74)
         fmt.space_before = Pt(0)
         fmt.space_after = Pt(0)
         fmt.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
         fmt.line_spacing = Pt(12)
+
+        # 前两行（作文标题、——作者）居中，不设首行缩进
+        if inserted_count < 2:
+            new_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        else:
+            fmt.first_line_indent = Cm(0.74)
 
         # 把刚创建在文档末尾的段落移动到指定位置
         try:
@@ -691,7 +758,7 @@ def insert_before_text(doc: Document, new_paragraphs):
 
 def insert_after_text(doc: Document, new_paragraphs):
     """
-    在“修改后：”下面插入段落（不移动现有段落），如果未找到则追加到文档末尾。
+    在"修改后："下面插入段落（不移动现有段落），如果未找到则追加到文档末尾。
     """
     insert_index = None
     for i, p in enumerate(doc.paragraphs):
@@ -701,6 +768,7 @@ def insert_after_text(doc: Document, new_paragraphs):
     if insert_index is None:
         insert_index = len(doc.paragraphs)
 
+    inserted_count = 0
     for para in new_paragraphs:
         if not para or not para.strip():
             continue
@@ -708,22 +776,29 @@ def insert_after_text(doc: Document, new_paragraphs):
             continue
         new_p = doc.add_paragraph(para)
         fmt = new_p.paragraph_format
-        fmt.first_line_indent = Cm(0.74)
         fmt.space_before = Pt(0)
         fmt.space_after = Pt(0)
         fmt.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
         fmt.line_spacing = Pt(12)
+
+        # 前两行（作文标题、——作者）居中，不设首行缩进
+        if inserted_count < 2:
+            new_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        else:
+            fmt.first_line_indent = Cm(0.74)
+
         try:
             doc._body._body.insert(insert_index, new_p._element)
         except Exception:
             _LOGGER.exception("insert_after_text 插入段落失败")
             continue
         insert_index += 1
+        inserted_count += 1
 
 
 
 # ai 纠错功能
-def fix_docx_with_llm(docx_path: str, task_name: str = "typo_fix"):
+def fix_docx_with_llm(docx_path: str, task_name: str = "typo_fix", log_callback=print, task_status_callback=None):
     """Use an OpenAI-compatible LLM to fix typos inside the '修改前' section of the docx."""
     task_cfg = (config.get("LLM", {}) or {}).get("TASKS", {}).get(task_name, {})
     if not bool(task_cfg.get("ENABLED", False)):
@@ -743,20 +818,47 @@ def fix_docx_with_llm(docx_path: str, task_name: str = "typo_fix"):
         prompt_template = DEFAULT_TYPO_FIX_PROMPT
 
     last_err = None
-    fixed_text = None
+    result_data = None
     for base_url, client in clients:
         try:
             _LOGGER.info(f"尝试 LLM 节点：{base_url}")
-            fixed_text = llm_fix_typos(prompt_template, full_text, client, model=model)
+            result_data = llm_fix_typos(prompt_template, full_text, client, model=model)
             _LOGGER.info(f"LLM 节点成功：{base_url}")
             break
         except Exception as e:
             last_err = e
             _LOGGER.warning(f"LLM 节点失败：{base_url} -> {e}")
 
-    if fixed_text is None:
+    if result_data is None:
         raise last_err or RuntimeError("所有 LLM 节点均不可用")
 
+    # 在Python后台显示元数据信息
+    print("\n" + "=" * 50)
+    print("📋 从文章中识别的元数据信息：")
+    print("=" * 50)
+    print(f"作文标题= {result_data.get('作文标题', '未知')}")
+    print(f"作者= {result_data.get('作者', '未知')}")
+    print(f"原文字数= {result_data.get('原文字数', '未知')}")
+    print(f"年级= {result_data.get('年级', '未知')}")
+    print(f"线上/线下= {result_data.get('线上或线下', '未知')}")
+    print("=" * 50 + "\n")
+
+    # 通过task_status_callback更新GUI表格中的元数据信息
+    if task_status_callback:
+        folder_path = os.path.dirname(docx_path)
+        task_status_callback(
+            folder_path,
+            "running",
+            step="AI错别字修正",
+            log_msg="元数据识别完成",
+            grade=str(result_data.get('年级', '未知')),
+            online_offline=str(result_data.get('线上或线下', '未知')),
+            before_count=str(result_data.get('原文字数', '未知')),
+            essay_title=str(result_data.get('作文标题', '未知'))
+        )
+
+    # 提取修改后的内容
+    fixed_text = result_data.get("修改后内容", full_text)
     fixed_paragraphs = [p.strip() for p in fixed_text.split("\n") if p.strip()]
 
     clear_before_text(doc)
@@ -783,7 +885,7 @@ def edit_docx_with_llm(docx_path: str, task_name: str = "editor", log_callback=p
     full_text = "\n".join(corrected_paragraphs)
 
     if not prompt_template:
-        prompt_template = DEFAULT_TYPO_FIX_PROMPT
+        prompt_template = DEFAULT_EDITOR_PROMPT
 
     count_min = task_cfg.get("COUNT_MIN")
     count_max = task_cfg.get("COUNT_MAX")
@@ -833,6 +935,7 @@ def edit_docx_with_llm(docx_path: str, task_name: str = "editor", log_callback=p
     edited_paragraphs = [p.strip() for p in result_text.split("\n") if p.strip()]
     insert_after_text(doc, edited_paragraphs)
     doc.save(docx_path)
+    return new_count
 
 
 
